@@ -1,0 +1,25 @@
+[package]
+name = "dao"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "diagon"
+path = "src/main.rs"
+
+[dependencies]
+sha2 = "0.10"
+pqcrypto-dilithium = "0.5"
+pqcrypto-traits = "0.3"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_cbor = "0.11"
+bincode = "1.3"
+hex = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
