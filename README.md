@@ -264,14 +264,12 @@ cargo test test_three_node_mesh
 
 ## Genesis Pools
 
-Three pools are active at genesis (commitments shown):
-```
-#1 801e100b... [genesis]
-#2 93a780b1... [genesis]
-#3 c78dec83... [genesis]
-```
+Three pools are active at genesis:
 
-Contact existing network participants to obtain genesis passphrases.
+- `quantum leap beyond horizon` [genesis]
+- `truth decays without witnesses` [genesis]
+- `daylight fades from dawn` [genesis]
+
 
 ## Architectural Manifest
 
