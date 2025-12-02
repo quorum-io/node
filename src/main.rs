@@ -1,946 +1,784 @@
-// DIAGON 0.5.1
-// Essential additions for the DIAGON Thesis:
-// - Trust Scoring (semantic elaboration quality)
-// - Trust-Gated Proposals (earned participation rights)
-// - Pruning (democratic content moderation)
-// - Entry Type Tracking in Proposals
-// - Proper persistence with validation on reload
-
 use std::{
-    collections::{HashMap, HashSet},
-    io::{self, Read, Write, ErrorKind, BufWriter, BufRead},
-    net::{TcpStream, TcpListener, SocketAddr},
-    sync::{
-        Arc, Mutex, RwLock,
-        mpsc::{self, Sender, Receiver},
-        atomic::{AtomicBool, Ordering},
-    },
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    collections::{HashMap, HashSet, BTreeMap, VecDeque},
     fs::File,
-    path::Path,
+    io::{self, Read, Write, BufReader, BufWriter, ErrorKind},
+    net::{TcpListener, TcpStream, SocketAddr, Shutdown},
+    sync::{Arc, RwLock, Mutex, Weak, atomic::{AtomicBool, AtomicU64, Ordering}},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    fmt,
 };
 
 use sha2::{Sha256, Digest};
 use pqcrypto_dilithium::dilithium3::*;
-use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _, DetachedSignature as _};
+use pqcrypto_traits::sign::{PublicKey as PqPublicKey, SecretKey as PqSecretKey, DetachedSignature as _};
 use serde::{Serialize, Deserialize};
-use rand::RngCore;
+use rand::{RngCore, rngs::OsRng};
 
 // ============================================================================
-// CONSTANTS
+// BIOLOGICAL CONSTANTS
 // ============================================================================
 
-const MAX_MESSAGE_SIZE: usize = 1_048_576;
-const AUTH_TIMEOUT_SECS: u64 = 30;
-const MIN_ELABORATION_LEN: usize = 20;
-const MAX_ELABORATION_LEN: usize = 10_000;
-const MAX_ENTRY_DATA_SIZE: usize = 60_000;
-const HEARTBEAT_SECS: u64 = 30;
+const EIGEN_THRESHOLD: f64 = 0.67;
+const SIGNAL_HALF_LIFE: u64 = 300;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const SYNC_INTERVAL: Duration = Duration::from_secs(60);
 const PEER_TIMEOUT_SECS: u64 = 150;
-const CHALLENGE_DOMAIN: &[u8] = b"DIAGON-V2-CHALLENGE:";
-const MIN_TIMESTAMP: u64 = 1704067200; // 2024-01-01
-const MAX_TIMESTAMP_DRIFT_SECS: u64 = 300;
+const CHALLENGE_TIMEOUT_SECS: u64 = 30;
+const MIN_ELABORATION_LEN: usize = 20;
+const MAX_MESSAGE_SIZE: usize = 1_048_576;
+const MAX_CONNECTIONS: usize = 100;
+const CONNECTION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+const TRUST_DEFAULT: f64 = 0.5;
+const TRUST_HISTORY_WEIGHT: f64 = 0.7;
+const TRUST_NEW_WEIGHT: f64 = 0.3;
+const TRUST_MIN_FOR_PROPOSE: f64 = 0.4;
 
-// Trust thresholds
-const MIN_TRUST_FOR_PROPOSALS: f64 = 0.4;
-const INITIAL_TRUST: f64 = 0.5;
+static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ============================================================================
-// UTILITIES
+// ERROR TYPES
 // ============================================================================
 
-fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hasher.finalize().into()
+#[derive(Debug)]
+pub enum DiagonError {
+    Io(io::Error),
+    Serialization(String),
+    Crypto(String),
+    Validation(String),
+    InsufficientTrust(f64),
+    RateLimited,
+    ConnectionLost,
+    MessageTooLarge,
+    PoolFull,
 }
 
-fn current_timestamp() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+impl fmt::Display for DiagonError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "IO: {}", e),
+            Self::Serialization(s) => write!(f, "Serialization: {}", s),
+            Self::Crypto(s) => write!(f, "Crypto: {}", s),
+            Self::Validation(s) => write!(f, "Validation: {}", s),
+            Self::InsufficientTrust(t) => write!(f, "Insufficient trust: {:.2}", t),
+            Self::RateLimited => write!(f, "Rate limited"),
+            Self::ConnectionLost => write!(f, "Connection lost"),
+            Self::MessageTooLarge => write!(f, "Message too large"),
+            Self::PoolFull => write!(f, "Connection pool full"),
+        }
+    }
 }
 
-#[inline(never)]
-fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    std::hint::black_box(result) == 0
+impl From<io::Error> for DiagonError {
+    fn from(e: io::Error) -> Self { Self::Io(e) }
 }
 
-fn validate_timestamp(timestamp: u64) -> Result<(), &'static str> {
-    let now = current_timestamp();
-    if timestamp < MIN_TIMESTAMP {
-        return Err("Timestamp too old");
-    }
-    if timestamp < now.saturating_sub(MAX_TIMESTAMP_DRIFT_SECS) {
-        return Err("Timestamp too far in past");
-    }
-    if timestamp > now + MAX_TIMESTAMP_DRIFT_SECS {
-        return Err("Timestamp too far in future");
-    }
-    Ok(())
-}
+type Result<T> = std::result::Result<T, DiagonError>;
 
-fn validate_elaboration(text: &str) -> Result<(), &'static str> {
-    if text.len() < MIN_ELABORATION_LEN {
-        return Err("Elaboration too short");
-    }
-    if text.len() > MAX_ELABORATION_LEN {
-        return Err("Elaboration too long");
-    }
-    Ok(())
-}
+// ============================================================================
+// CONTENT IDENTIFIERS
+// ============================================================================
 
-/// Score elaboration quality based on vocabulary diversity and substance.
-/// Returns 0.0 to 1.0 - rewards thoughtful, unique contributions.
-fn score_elaboration(text: &str) -> f64 {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.is_empty() {
-        return 0.0;
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Cid(pub [u8; 32]);
+
+impl Cid {
+    pub fn new(data: &[u8]) -> Self {
+        let nonce = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hasher.update(&nonce.to_le_bytes());
+        hasher.update(&timestamp().to_le_bytes());
+        Cid(hasher.finalize().into())
     }
     
-    // Vocabulary diversity - rewards unique word choice
-    let unique: HashSet<&str> = words.iter().copied().collect();
-    let uniqueness = unique.len() as f64 / words.len() as f64;
-    
-    // Substance score - caps at 100 words to avoid rewarding verbosity
-    let length_score = (words.len() as f64 / 100.0).min(1.0);
-    
-    // Equal weight to diversity and substance
-    (uniqueness * 0.5 + length_score * 0.5).clamp(0.0, 1.0)
+    pub fn short(&self) -> String { hex::encode(&self.0[..8]) }
 }
 
-// ============================================================================
-// IDENTITY TYPES
-// ============================================================================
+impl fmt::Debug for Cid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "Cid({})", self.short()) }
+}
+
+impl fmt::Display for Cid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.short()) }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Did(pub String);
 
 impl Did {
-    pub fn from_pubkey(pk: &PublicKey) -> Self {
-        Did(format!("did:diagon:{}", hex::encode(&pk.as_bytes()[..32])))
+    pub fn from_pubkey(pubkey: &PublicKey) -> Self {
+        Did(format!("did:diagon:{}", hex::encode(&pubkey.as_bytes()[..16])))
     }
-
+    
     pub fn short(&self) -> String {
-        if self.0.len() > 24 {
-            format!("{}..{}", &self.0[..16], &self.0[self.0.len() - 6..])
-        } else {
-            self.0.clone()
+        if self.0.len() > 20 { format!("{}...", &self.0[12..28]) } else { self.0.clone() }
+    }
+}
+
+impl fmt::Display for Did {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.short()) }
+}
+
+// ============================================================================
+// ARENA ALLOCATOR
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub struct SexpRef(u32);
+
+impl SexpRef {
+    pub const NIL: SexpRef = SexpRef(0);
+    pub fn is_nil(&self) -> bool { self.0 == 0 }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SexpNode {
+    Nil,
+    Atom(String),
+    Int(i64),
+    Bytes(Vec<u8>),
+    Cons { car: SexpRef, cdr: SexpRef, #[serde(skip)] hash: Option<[u8; 32]> },
+}
+
+#[derive(Default)]
+pub struct Arena {
+    nodes: Vec<SexpNode>,
+    atoms: HashMap<String, SexpRef>,
+    cache: HashMap<[u8; 32], SexpRef>,
+}
+
+impl Arena {
+    pub fn new() -> Self {
+        let mut arena = Self { nodes: Vec::with_capacity(4096), atoms: HashMap::new(), cache: HashMap::new() };
+        arena.nodes.push(SexpNode::Nil);
+        arena
+    }
+    
+    pub fn atom(&mut self, s: &str) -> SexpRef {
+        if let Some(&idx) = self.atoms.get(s) { return idx; }
+        let idx = SexpRef(self.nodes.len() as u32);
+        self.nodes.push(SexpNode::Atom(s.to_string()));
+        self.atoms.insert(s.to_string(), idx);
+        idx
+    }
+    
+    pub fn cons(&mut self, car: SexpRef, cdr: SexpRef) -> SexpRef {
+        let idx = SexpRef(self.nodes.len() as u32);
+        self.nodes.push(SexpNode::Cons { car, cdr, hash: None });
+        idx
+    }
+    
+    pub fn int(&mut self, n: i64) -> SexpRef {
+        let idx = SexpRef(self.nodes.len() as u32);
+        self.nodes.push(SexpNode::Int(n));
+        idx
+    }
+    
+    pub fn bytes(&mut self, b: &[u8]) -> SexpRef {
+        let idx = SexpRef(self.nodes.len() as u32);
+        self.nodes.push(SexpNode::Bytes(b.to_vec()));
+        idx
+    }
+    
+    pub fn list(&mut self, items: &[SexpRef]) -> SexpRef {
+        let mut result = SexpRef::NIL;
+        for &item in items.iter().rev() { result = self.cons(item, result); }
+        result
+    }
+    
+    pub fn get(&self, idx: SexpRef) -> &SexpNode { &self.nodes[idx.0 as usize] }
+    fn get_mut(&mut self, idx: SexpRef) -> &mut SexpNode { &mut self.nodes[idx.0 as usize] }
+    pub fn car(&self, idx: SexpRef) -> SexpRef { match self.get(idx) { SexpNode::Cons { car, .. } => *car, _ => SexpRef::NIL } }
+    pub fn cdr(&self, idx: SexpRef) -> SexpRef { match self.get(idx) { SexpNode::Cons { cdr, .. } => *cdr, _ => SexpRef::NIL } }
+    
+    pub fn nth(&self, list: SexpRef, n: usize) -> SexpRef {
+        let mut current = list;
+        for _ in 0..n { current = self.cdr(current); }
+        self.car(current)
+    }
+    
+    pub fn hash(&mut self, idx: SexpRef) -> [u8; 32] {
+        if let SexpNode::Cons { hash: Some(h), .. } = self.get(idx) { return *h; }
+        let mut hasher = Sha256::new();
+        self.hash_into(idx, &mut hasher);
+        let result: [u8; 32] = hasher.finalize().into();
+        if let SexpNode::Cons { hash, .. } = self.get_mut(idx) { *hash = Some(result); }
+        result
+    }
+    
+    fn hash_into(&self, idx: SexpRef, hasher: &mut Sha256) {
+        match self.get(idx) {
+            SexpNode::Nil => hasher.update(&[0u8]),
+            SexpNode::Atom(s) => { hasher.update(&[1u8]); hasher.update(&(s.len() as u32).to_le_bytes()); hasher.update(s.as_bytes()); }
+            SexpNode::Int(n) => { hasher.update(&[2u8]); hasher.update(&n.to_le_bytes()); }
+            SexpNode::Bytes(b) => { hasher.update(&[3u8]); hasher.update(&(b.len() as u32).to_le_bytes()); hasher.update(b); }
+            SexpNode::Cons { car, cdr, hash } => {
+                if let Some(h) = hash { hasher.update(&[4u8]); hasher.update(h); }
+                else { hasher.update(&[4u8]); self.hash_into(*car, hasher); self.hash_into(*cdr, hasher); }
+            }
+        }
+    }
+    
+    pub fn intern(&mut self, idx: SexpRef) -> (Cid, SexpRef) {
+        let hash = self.hash(idx);
+        if let Some(&existing) = self.cache.get(&hash) { return (Cid(hash), existing); }
+        self.cache.insert(hash, idx);
+        (Cid(hash), idx)
+    }
+    
+    pub fn lookup(&self, cid: &Cid) -> Option<SexpRef> { self.cache.get(&cid.0).copied() }
+    
+    pub fn display(&self, idx: SexpRef) -> String {
+        match self.get(idx) {
+            SexpNode::Nil => "()".to_string(),
+            SexpNode::Atom(s) => s.clone(),
+            SexpNode::Int(n) => n.to_string(),
+            SexpNode::Bytes(b) => format!("#x{}", hex::encode(b)),
+            SexpNode::Cons { .. } => {
+                let mut parts = Vec::new();
+                let mut current = idx;
+                while let SexpNode::Cons { car, cdr, .. } = self.get(current) {
+                    parts.push(self.display(*car));
+                    current = *cdr;
+                }
+                if current.is_nil() { format!("({})", parts.join(" ")) }
+                else { format!("({} . {})", parts.join(" "), self.display(current)) }
+            }
+        }
+    }
+    
+    pub fn parse(&mut self, input: &str) -> Option<SexpRef> {
+        let tokens = tokenize(input);
+        let mut pos = 0;
+        self.parse_tokens(&tokens, &mut pos)
+    }
+    
+    fn parse_tokens(&mut self, tokens: &[Token], pos: &mut usize) -> Option<SexpRef> {
+        if *pos >= tokens.len() { return None; }
+        match &tokens[*pos] {
+            Token::LParen => {
+                *pos += 1;
+                let mut items = Vec::new();
+                while *pos < tokens.len() {
+                    if let Token::RParen = &tokens[*pos] { *pos += 1; return Some(self.list(&items)); }
+                    items.push(self.parse_tokens(tokens, pos)?);
+                }
+                None
+            }
+            Token::RParen => None,
+            Token::Atom(s) => {
+                *pos += 1;
+                if let Ok(n) = s.parse::<i64>() { return Some(self.int(n)); }
+                if s.starts_with("#x") { if let Ok(bytes) = hex::decode(&s[2..]) { return Some(self.bytes(&bytes)); } }
+                Some(self.atom(s))
+            }
+            Token::String(s) => { *pos += 1; Some(self.atom(s)) }
+        }
+    }
+    
+    pub fn serialize(&self, idx: SexpRef) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.serialize_into(idx, &mut buf);
+        buf
+    }
+    
+    fn serialize_into(&self, idx: SexpRef, buf: &mut Vec<u8>) {
+        match self.get(idx) {
+            SexpNode::Nil => buf.push(0),
+            SexpNode::Atom(s) => { buf.push(1); buf.extend_from_slice(&(s.len() as u32).to_le_bytes()); buf.extend_from_slice(s.as_bytes()); }
+            SexpNode::Int(n) => { buf.push(2); buf.extend_from_slice(&n.to_le_bytes()); }
+            SexpNode::Bytes(b) => { buf.push(3); buf.extend_from_slice(&(b.len() as u32).to_le_bytes()); buf.extend_from_slice(b); }
+            SexpNode::Cons { car, cdr, .. } => { buf.push(4); self.serialize_into(*car, buf); self.serialize_into(*cdr, buf); }
+        }
+    }
+    
+    pub fn deserialize(&mut self, data: &[u8]) -> Option<SexpRef> {
+        let mut pos = 0;
+        self.deserialize_from(data, &mut pos)
+    }
+    
+    fn deserialize_from(&mut self, data: &[u8], pos: &mut usize) -> Option<SexpRef> {
+        if *pos >= data.len() { return None; }
+        match data[*pos] {
+            0 => { *pos += 1; Some(SexpRef::NIL) }
+            1 => {
+                *pos += 1;
+                if *pos + 4 > data.len() { return None; }
+                let len = u32::from_le_bytes(data[*pos..*pos+4].try_into().ok()?) as usize;
+                *pos += 4;
+                if *pos + len > data.len() { return None; }
+                let s = std::str::from_utf8(&data[*pos..*pos+len]).ok()?;
+                *pos += len;
+                Some(self.atom(s))
+            }
+            2 => {
+                *pos += 1;
+                if *pos + 8 > data.len() { return None; }
+                let n = i64::from_le_bytes(data[*pos..*pos+8].try_into().ok()?);
+                *pos += 8;
+                Some(self.int(n))
+            }
+            3 => {
+                *pos += 1;
+                if *pos + 4 > data.len() { return None; }
+                let len = u32::from_le_bytes(data[*pos..*pos+4].try_into().ok()?) as usize;
+                *pos += 4;
+                if *pos + len > data.len() { return None; }
+                let b = &data[*pos..*pos+len];
+                *pos += len;
+                Some(self.bytes(b))
+            }
+            4 => {
+                *pos += 1;
+                let car = self.deserialize_from(data, pos)?;
+                let cdr = self.deserialize_from(data, pos)?;
+                Some(self.cons(car, cdr))
+            }
+            _ => None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Cid(pub [u8; 32]);
+#[derive(Debug)]
+enum Token { LParen, RParen, Atom(String), String(String) }
 
-impl Cid {
-    pub fn from_entry_data(data: &[u8], timestamp: u64, creator: &Did) -> Self {
-        let input = [data, &timestamp.to_le_bytes(), creator.0.as_bytes()].concat();
-        Cid(sha256(&input))
-    }
-
-    pub fn short(&self) -> String {
-        hex::encode(&self.0[..8])
-    }
-}
-
-// ============================================================================
-// TRUST SYSTEM
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrustScore {
-    pub score: f64,
-    pub interaction_count: u32,
-    pub last_updated: u64,
-}
-
-impl TrustScore {
-    fn new() -> Self {
-        Self {
-            score: INITIAL_TRUST,
-            interaction_count: 0,
-            last_updated: current_timestamp(),
+fn tokenize(input: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        match c {
+            '(' => { tokens.push(Token::LParen); chars.next(); }
+            ')' => { tokens.push(Token::RParen); chars.next(); }
+            '"' => {
+                chars.next();
+                let mut s = String::new();
+                while let Some(&c) = chars.peek() { if c == '"' { chars.next(); break; } s.push(c); chars.next(); }
+                tokens.push(Token::String(s));
+            }
+            c if c.is_whitespace() => { chars.next(); }
+            ';' => { while let Some(&c) = chars.peek() { chars.next(); if c == '\n' { break; } } }
+            _ => {
+                let mut atom = String::new();
+                while let Some(&c) = chars.peek() { if c.is_whitespace() || c == '(' || c == ')' { break; } atom.push(c); chars.next(); }
+                if !atom.is_empty() { tokens.push(Token::Atom(atom)); }
+            }
         }
     }
-
-    fn update_from_elaboration(&mut self, elaboration: &str) {
-        let quality = score_elaboration(elaboration);
-        // Weighted moving average - history matters but recent activity matters more
-        self.score = (self.score * 0.7) + (quality * 0.3);
-        self.interaction_count += 1;
-        self.last_updated = current_timestamp();
-    }
+    tokens
 }
 
 // ============================================================================
-// ENTRY & PROPOSAL
+// EXPRESSION STORE
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Entry {
-    pub cid: Cid,
-    pub entry_type: EntryType,
-    pub data: Vec<u8>,
-    pub creator: Did,
+pub struct ExprStore {
+    expressions: HashMap<Cid, SexpRef>,
+    log: Vec<Cid>,
+    arena: Arena,
+}
+
+impl ExprStore {
+    pub fn new() -> Self { Self { expressions: HashMap::new(), log: Vec::new(), arena: Arena::new() } }
+    
+    pub fn store(&mut self, expr: SexpRef) -> (Cid, bool) {
+        let (cid, canonical) = self.arena.intern(expr);
+        let is_new = !self.expressions.contains_key(&cid);
+        if is_new { self.expressions.insert(cid, canonical); self.log.push(cid); }
+        (cid, is_new)
+    }
+    
+    pub fn fetch(&self, cid: &Cid) -> Option<SexpRef> { self.expressions.get(cid).copied() }
+    pub fn has(&self, cid: &Cid) -> bool { self.expressions.contains_key(cid) }
+    pub fn log(&self) -> &[Cid] { &self.log }
+    pub fn arena(&self) -> &Arena { &self.arena }
+    pub fn arena_mut(&mut self) -> &mut Arena { &mut self.arena }
+    pub fn serialize_expr(&self, cid: &Cid) -> Option<Vec<u8>> { self.expressions.get(cid).map(|&idx| self.arena.serialize(idx)) }
+    
+    pub fn deserialize_and_store(&mut self, data: &[u8]) -> Option<(Cid, bool)> {
+        let expr = self.arena.deserialize(data)?;
+        Some(self.store(expr))
+    }
+    
+    pub fn merkle_root(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        for cid in &self.log { hasher.update(&cid.0); }
+        hasher.finalize().into()
+    }
+}
+
+impl Default for ExprStore { fn default() -> Self { Self::new() } }
+
+// ============================================================================
+// QUORUM SENSING
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QuorumSignal {
+    pub source: Did,
+    pub target: Cid,
+    pub weight: u64,
+    pub support: bool,
+    pub elaboration: String,
     pub timestamp: u64,
     pub signature: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum EntryType {
-    Knowledge {
-        category: String,
-        concept: String,
-        content: String,
-    },
-    Proposal {
-        text: String,
-    },
-    /// Democratic content removal - requires reason
-    Prune {
-        target: Cid,
-        reason: String,
-    },
+impl QuorumSignal {
+    pub fn current_strength(&self) -> u64 {
+        let age = timestamp().saturating_sub(self.timestamp);
+        let decay = (-(age as f64) / SIGNAL_HALF_LIFE as f64).exp();
+        (self.weight as f64 * decay) as u64
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Proposal {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QuorumState {
+    pub target: Cid,
+    pub threshold: u64,
+    pub signals_for: Vec<QuorumSignal>,
+    pub signals_against: Vec<QuorumSignal>,
+    pub sources_seen: HashSet<Did>,
+    pub created: u64,
+}
+
+impl QuorumState {
+    pub fn new(target: Cid, threshold: u64) -> Self {
+        Self { target, threshold, signals_for: Vec::new(), signals_against: Vec::new(), sources_seen: HashSet::new(), created: timestamp() }
+    }
+    
+    pub fn sense(&mut self, signal: QuorumSignal) -> bool {
+        if self.sources_seen.contains(&signal.source) || signal.target != self.target { return false; }
+        self.sources_seen.insert(signal.source.clone());
+        if signal.support { self.signals_for.push(signal); } else { self.signals_against.push(signal); }
+        true
+    }
+    
+    pub fn accumulated_for(&self) -> u64 { self.signals_for.iter().map(|s| s.current_strength()).sum() }
+    pub fn reached(&self) -> bool { self.accumulated_for() >= self.threshold }
+}
+
+// ============================================================================
+// EPIGENETIC MARKS
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EpigeneticMark {
+    pub score: f64,
+    pub interactions: u32,
+    pub last_active: u64,
+}
+
+impl EpigeneticMark {
+    pub fn new() -> Self { Self { score: TRUST_DEFAULT, interactions: 0, last_active: timestamp() } }
+    
+    pub fn update(&mut self, quality: f64) {
+        self.score = self.score * TRUST_HISTORY_WEIGHT + quality * TRUST_NEW_WEIGHT;
+        self.interactions += 1;
+        self.last_active = timestamp();
+    }
+    
+    pub fn current_score(&self) -> f64 {
+        let age = timestamp().saturating_sub(self.last_active);
+        let decay = (-(age as f64) / (SIGNAL_HALF_LIFE as f64 * 10.0)).exp();
+        self.score * (0.5 + 0.5 * decay)
+    }
+    
+    pub fn signal_weight(&self) -> u64 { ((self.current_score() * 1000.0) as u64).max(100) }
+}
+
+impl Default for EpigeneticMark { fn default() -> Self { Self::new() } }
+
+// ============================================================================
+// PROPOSAL STATE
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProposalState {
     pub cid: Cid,
-    pub entry_type: EntryType,  // Track what we're voting on
+    pub expr_data: Vec<u8>,
     pub proposer: Did,
     pub elaboration: String,
-    pub votes_for: HashMap<Did, String>,
-    pub votes_against: HashMap<Did, String>,
-    pub threshold: i32,
+    pub quorum: QuorumState,
     pub executed: bool,
+    pub created: u64,
 }
 
 // ============================================================================
-// PROTOCOL MESSAGES
+// POOL STATE
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PoolState {
+    pub commitment: [u8; 32],
+    pub hint: String,
+    pub rationale: String,
+    pub proposer: Did,
+    pub quorum: QuorumState,
+    pub active: bool,
+}
+
+const GENESIS_POOLS: [[u8; 32]; 3] = [
+    [0x80, 0x1e, 0x10, 0x0b, 0x0c, 0xa3, 0x10, 0x30, 0xa6, 0xb2, 0x9f, 0x69, 0x2d, 0x0f, 0x19, 0x4c,
+     0x33, 0x07, 0x0f, 0xeb, 0x59, 0x50, 0x66, 0x60, 0xad, 0x7b, 0x90, 0x81, 0x3e, 0x42, 0x7b, 0x8b],
+    [0x93, 0xa7, 0x80, 0xb1, 0x41, 0x61, 0x53, 0x86, 0xdb, 0x23, 0x6c, 0x6a, 0xe2, 0x9d, 0xed, 0x8c,
+     0x7c, 0x42, 0xf2, 0x77, 0xa6, 0xfa, 0x28, 0x22, 0x9f, 0x7c, 0x75, 0x76, 0x49, 0xd3, 0xdc, 0xcb],
+    [0xc7, 0x8d, 0xec, 0x83, 0xf3, 0xab, 0x88, 0xc4, 0xfd, 0x66, 0x2c, 0x88, 0x0e, 0x25, 0x8f, 0x63,
+     0x45, 0xaa, 0xff, 0x91, 0x79, 0xd5, 0x37, 0x18, 0xa5, 0x3c, 0x84, 0x11, 0x85, 0xf6, 0x3a, 0x85],
+];
+
+// ============================================================================
+// DERIVED STATE
+// ============================================================================
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct DerivedState {
+    pub proposals: BTreeMap<Cid, ProposalState>,
+    pub pool_proposals: BTreeMap<[u8; 32], PoolState>,
+    pub active_pools: HashSet<[u8; 32]>,
+    pub pruned: HashSet<Cid>,
+    pub marks: HashMap<Did, EpigeneticMark>,
+}
+
+impl DerivedState {
+    pub fn new() -> Self {
+        let mut state = Self::default();
+        for pool in GENESIS_POOLS.iter() { state.active_pools.insert(*pool); }
+        state
+    }
+    
+    pub fn threshold(&self, peer_count: usize) -> u64 {
+        (((peer_count + 1) as f64 * EIGEN_THRESHOLD * 1000.0) as u64).max(1000)
+    }
+    
+    pub fn get_mark(&self, did: &Did) -> EpigeneticMark { self.marks.get(did).cloned().unwrap_or_default() }
+    pub fn update_mark(&mut self, did: &Did, quality: f64) { self.marks.entry(did.clone()).or_default().update(quality); }
+}
+
+// ============================================================================
+// MESSAGE FRAMER
+// ============================================================================
+
+struct MessageFramer {
+    len_buf: [u8; 4],
+    msg_buffer: Vec<u8>,
+    expected_len: usize,
+}
+
+impl MessageFramer {
+    fn new() -> Self { Self { len_buf: [0u8; 4], msg_buffer: Vec::with_capacity(MAX_MESSAGE_SIZE), expected_len: 0 } }
+    
+    fn read_message(&mut self, stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
+        if self.expected_len == 0 {
+            match stream.read_exact(&mut self.len_buf) {
+                Ok(_) => {
+                    self.expected_len = u32::from_be_bytes(self.len_buf) as usize;
+                    if self.expected_len > MAX_MESSAGE_SIZE { return Err(io::Error::new(ErrorKind::InvalidData, "Message too large")); }
+                    self.msg_buffer.clear();
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+        if self.expected_len > 0 {
+            let remaining = self.expected_len - self.msg_buffer.len();
+            let mut temp = vec![0u8; remaining.min(8192)];
+            match stream.read(&mut temp) {
+                Ok(0) => return Err(io::Error::new(ErrorKind::UnexpectedEof, "Connection closed")),
+                Ok(n) => {
+                    self.msg_buffer.extend_from_slice(&temp[..n]);
+                    if self.msg_buffer.len() >= self.expected_len {
+                        let msg = self.msg_buffer.clone();
+                        self.msg_buffer.clear();
+                        self.expected_len = 0;
+                        return Ok(Some(msg));
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+}
+
+// ============================================================================
+// TCP CONNECTION
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ConnectionState { Connecting, Authenticating, AwaitingElaboration, PendingApproval, Connected, Closing, Closed }
+
+struct TcpConnection {
+    stream: Arc<Mutex<TcpStream>>,
+    addr: SocketAddr,
+    did: Arc<RwLock<Option<Did>>>,
+    pubkey: Arc<RwLock<Option<Vec<u8>>>>,
+    state: Arc<RwLock<ConnectionState>>,
+    elaboration: Arc<RwLock<Option<String>>>,
+    last_activity: Arc<RwLock<Instant>>,
+    seen_cids: Arc<RwLock<HashSet<Cid>>>,
+    challenge_sent: Arc<RwLock<Option<[u8; 32]>>>,
+    challenge_time: Arc<RwLock<Option<Instant>>>,
+    initiated: bool,  // true = we initiated this connection, false = they connected to us
+}
+
+impl TcpConnection {
+    fn new(stream: TcpStream, addr: SocketAddr, initiated: bool) -> Result<Self> {
+        stream.set_nodelay(true)?;
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+        Ok(Self {
+            stream: Arc::new(Mutex::new(stream)), addr,
+            did: Arc::new(RwLock::new(None)), pubkey: Arc::new(RwLock::new(None)),
+            state: Arc::new(RwLock::new(ConnectionState::Connecting)),
+            elaboration: Arc::new(RwLock::new(None)),
+            last_activity: Arc::new(RwLock::new(Instant::now())),
+            seen_cids: Arc::new(RwLock::new(HashSet::new())),
+            challenge_sent: Arc::new(RwLock::new(None)),
+            challenge_time: Arc::new(RwLock::new(None)),
+            initiated,
+        })
+    }
+    
+    fn send(&self, data: &[u8]) -> Result<()> {
+        let state = *self.state.read().unwrap();
+        if state == ConnectionState::Closed || state == ConnectionState::Closing { return Err(DiagonError::ConnectionLost); }
+        if data.len() > MAX_MESSAGE_SIZE { return Err(DiagonError::MessageTooLarge); }
+        let mut stream = self.stream.lock().unwrap();
+        stream.write_all(&(data.len() as u32).to_be_bytes())?;
+        stream.write_all(data)?;
+        stream.flush()?;
+        *self.last_activity.write().unwrap() = Instant::now();
+        Ok(())
+    }
+    
+    fn mark_seen(&self, cid: &Cid) { self.seen_cids.write().unwrap().insert(*cid); }
+    fn has_seen(&self, cid: &Cid) -> bool { self.seen_cids.read().unwrap().contains(cid) }
+    fn is_alive(&self) -> bool {
+        let state = *self.state.read().unwrap();
+        let last = *self.last_activity.read().unwrap();
+        state != ConnectionState::Closed && state != ConnectionState::Closing && last.elapsed() < Duration::from_secs(PEER_TIMEOUT_SECS)
+    }
+    fn is_authenticated(&self) -> bool { *self.state.read().unwrap() == ConnectionState::Connected }
+    fn close(&self) {
+        *self.state.write().unwrap() = ConnectionState::Closing;
+        if let Ok(stream) = self.stream.lock() { let _ = stream.shutdown(Shutdown::Both); }
+        *self.state.write().unwrap() = ConnectionState::Closed;
+    }
+}
+
+// ============================================================================
+// CONNECTION POOL
+// ============================================================================
+
+struct ConnectionPool {
+    connections: Arc<RwLock<HashMap<SocketAddr, Arc<TcpConnection>>>>,
+    by_did: Arc<RwLock<HashMap<Did, Vec<SocketAddr>>>>,
+    readers: Arc<Mutex<HashMap<SocketAddr, JoinHandle<()>>>>,
+}
+
+impl ConnectionPool {
+    fn new() -> Self {
+        Self {
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            by_did: Arc::new(RwLock::new(HashMap::new())),
+            readers: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+    
+    fn add(&self, addr: SocketAddr, conn: Arc<TcpConnection>) -> Result<()> {
+        let mut conns = self.connections.write().unwrap();
+        if conns.len() >= MAX_CONNECTIONS {
+            if let Some(oldest) = conns.iter().filter(|(_, c)| !c.is_authenticated()).min_by_key(|(_, c)| *c.last_activity.read().unwrap()).map(|(a, _)| *a) {
+                drop(conns); self.remove(oldest); conns = self.connections.write().unwrap();
+            } else { return Err(DiagonError::PoolFull); }
+        }
+        conns.insert(addr, conn);
+        Ok(())
+    }
+    
+    fn add_reader(&self, addr: SocketAddr, handle: JoinHandle<()>) { self.readers.lock().unwrap().insert(addr, handle); }
+    
+    fn register_did(&self, addr: SocketAddr, did: &Did) {
+        if let Some(conn) = self.connections.read().unwrap().get(&addr) {
+            *conn.did.write().unwrap() = Some(did.clone());
+            self.by_did.write().unwrap().entry(did.clone()).or_default().push(addr);
+        }
+    }
+    
+    fn get(&self, addr: &SocketAddr) -> Option<Arc<TcpConnection>> { self.connections.read().unwrap().get(addr).cloned() }
+    
+    fn remove(&self, addr: SocketAddr) {
+        if let Some(conn) = self.connections.write().unwrap().remove(&addr) {
+            if let Some(did) = conn.did.read().unwrap().as_ref() {
+                let mut by_did = self.by_did.write().unwrap();
+                if let Some(addrs) = by_did.get_mut(did) { addrs.retain(|a| *a != addr); if addrs.is_empty() { by_did.remove(did); } }
+            }
+            conn.close();
+        }
+        if let Some(h) = self.readers.lock().unwrap().remove(&addr) { thread::spawn(move || { let _ = h.join(); }); }
+    }
+    
+    fn authenticated_addrs(&self) -> Vec<SocketAddr> {
+        self.connections.read().unwrap().iter().filter(|(_, c)| c.is_authenticated()).map(|(a, _)| *a).collect()
+    }
+    
+    fn pending_approval(&self) -> Vec<(SocketAddr, Arc<TcpConnection>)> {
+        self.connections.read().unwrap().iter().filter(|(_, c)| *c.state.read().unwrap() == ConnectionState::PendingApproval).map(|(a, c)| (*a, c.clone())).collect()
+    }
+    
+    fn awaiting_elaboration(&self) -> Vec<(SocketAddr, Arc<TcpConnection>)> {
+        self.connections.read().unwrap().iter().filter(|(_, c)| *c.state.read().unwrap() == ConnectionState::AwaitingElaboration).map(|(a, c)| (*a, c.clone())).collect()
+    }
+    
+    fn shutdown(&self) {
+        let addrs: Vec<_> = self.connections.read().unwrap().keys().cloned().collect();
+        for addr in addrs { self.remove(addr); }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+// ============================================================================
+// NETWORK MESSAGES
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Message {
-    // Auth Phase
-    Connect {
-        did: Did,
-        pubkey: Vec<u8>,
-        pool: [u8; 32],
-    },
-    Challenge {
-        nonce: [u8; 32],
-        server_did: Did,
-        server_sig: Vec<u8>,
-        server_pubkey: Vec<u8>,
-    },
-    Response {
-        signature: Vec<u8>,
-        elaboration: String,
-    },
-    Authenticated {
-        peer_did: Did,
-    },
-    Rejected,
+pub enum NetMessage {
+    Hello { did: Did, pubkey: Vec<u8>, pool: [u8; 32], expr_root: [u8; 32] },
+    Challenge([u8; 32]),
+    Response { nonce: [u8; 32], signature: Vec<u8> },
+    ElaborateRequest,
+    Elaborate { text: String, signature: Vec<u8> },
+    Approve { signature: Vec<u8> },
+    Reject { reason: String, signature: Vec<u8> },
+    Expression(Vec<u8>),
+    Signal(QuorumSignal),
+    SyncRequest { merkle: [u8; 32], have: Vec<Cid> },
+    SyncReply { expressions: Vec<Vec<u8>> },
+    Heartbeat { signature: Vec<u8> },
+    Disconnect { signature: Vec<u8> },
+}
 
-    // Governance Phase
-    Propose {
-        entry: Entry,
-        elaboration: String,
-    },
-    Vote {
-        voter: Did,
-        target: Cid,
-        support: bool,
-        elaboration: String,
-        signature: Vec<u8>,
-    },
-
-    // Sync Phase
-    SyncRequest {
-        known_cids: Vec<Cid>,
-    },
-    SyncReply {
-        entries: Vec<Entry>,
-    },
-    NewEntry {
-        entry: Entry,
-    },
-
-    // Keepalive
-    Heartbeat,
+impl NetMessage {
+    fn serialize(&self) -> Result<Vec<u8>> { bincode::serialize(self).map_err(|e| DiagonError::Serialization(e.to_string())) }
+    fn deserialize(data: &[u8]) -> Result<Self> { bincode::deserialize(data).map_err(|e| DiagonError::Serialization(e.to_string())) }
 }
 
 // ============================================================================
-// MESSAGE FRAMING
-// ============================================================================
-
-fn write_msg(stream: &mut TcpStream, msg: &Message) -> io::Result<()> {
-    let data = bincode::serialize(msg)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-
-    if data.len() > MAX_MESSAGE_SIZE {
-        return Err(io::Error::new(ErrorKind::InvalidData, "Message too large"));
-    }
-
-    stream.write_all(&(data.len() as u32).to_be_bytes())?;
-    stream.write_all(&data)?;
-    stream.flush()
-}
-
-fn read_msg(stream: &mut TcpStream) -> io::Result<Message> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    if len > MAX_MESSAGE_SIZE {
-        return Err(io::Error::new(ErrorKind::InvalidData, "Message too large"));
-    }
-
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf)?;
-
-    bincode::deserialize(&buf)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
-}
-
-// ============================================================================
-// NODE IDENTITY
-// ============================================================================
-
-pub struct NodeIdentity {
-    pub did: Did,
-    pub public_key: PublicKey,
-    secret_key: SecretKey,
-    pub pool_commitment: [u8; 32],
-}
-
-impl NodeIdentity {
-    pub fn new(pool_passphrase: &str) -> Self {
-        let (public_key, secret_key) = keypair();
-        let did = Did::from_pubkey(&public_key);
-        let pool_commitment = sha256(pool_passphrase.as_bytes());
-        Self {
-            did,
-            public_key,
-            secret_key,
-            pool_commitment,
-        }
-    }
-
-    pub fn load_or_create(path: &str, pool_passphrase: &str) -> io::Result<Self> {
-        let pool_commitment = sha256(pool_passphrase.as_bytes());
-
-        if Path::new(path).exists() {
-            match std::fs::read(path) {
-                Ok(data) if !data.is_empty() => {
-                    match serde_cbor::from_slice::<(Vec<u8>, Vec<u8>, Did)>(&data) {
-                        Ok((pk_bytes, sk_bytes, did)) => {
-                            match (
-                                PublicKey::from_bytes(&pk_bytes),
-                                SecretKey::from_bytes(&sk_bytes),
-                            ) {
-                                (Ok(pk), Ok(sk)) => {
-                                    if Did::from_pubkey(&pk) == did {
-                                        println!("[IDENTITY] Restored {}", did.short());
-                                        return Ok(Self {
-                                            did,
-                                            public_key: pk,
-                                            secret_key: sk,
-                                            pool_commitment,
-                                        });
-                                    } else {
-                                        eprintln!("[IDENTITY] DID mismatch, regenerating");
-                                    }
-                                }
-                                _ => {
-                                    eprintln!("[IDENTITY] Key parse failed, regenerating");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[IDENTITY] Deserialize failed: {}, regenerating", e);
-                        }
-                    }
-                }
-                Ok(_) => {
-                    eprintln!("[IDENTITY] Empty file, regenerating");
-                }
-                Err(e) => {
-                    eprintln!("[IDENTITY] Read failed: {}, regenerating", e);
-                }
-            }
-        }
-
-        // Generate new identity
-        let (public_key, secret_key) = keypair();
-        let did = Did::from_pubkey(&public_key);
-
-        if let Some(parent) = Path::new(path).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        // Atomic write
-        let temp_path = format!("{}.tmp.{}", path, std::process::id());
-        {
-            let file = File::create(&temp_path)?;
-            let mut writer = BufWriter::new(file);
-            let identity = (
-                public_key.as_bytes().to_vec(),
-                secret_key.as_bytes().to_vec(),
-                did.clone(),
-            );
-            serde_cbor::to_writer(&mut writer, &identity)
-                .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
-            writer.flush()?;
-            let file = writer.into_inner()
-                .map_err(|e| io::Error::new(ErrorKind::Other, e.to_string()))?;
-            file.sync_all()?;
-        }
-        
-        #[cfg(windows)]
-        if Path::new(path).exists() {
-            std::fs::remove_file(path)?;
-        }
-        
-        std::fs::rename(&temp_path, path)?;
-        println!("[IDENTITY] Created new {}", did.short());
-
-        Ok(Self {
-            did,
-            public_key,
-            secret_key,
-            pool_commitment,
-        })
-    }
-
-    pub fn sign(&self, data: &[u8]) -> Vec<u8> {
-        detached_sign(data, &self.secret_key).as_bytes().to_vec()
-    }
-
-    pub fn verify(data: &[u8], sig: &[u8], pubkey: &PublicKey) -> bool {
-        DetachedSignature::from_bytes(sig)
-            .map(|s| verify_detached_signature(&s, data, pubkey).is_ok())
-            .unwrap_or(false)
-    }
-}
-
-// ============================================================================
-// PEER HANDLE
-// ============================================================================
-
-#[derive(Clone)]
-pub struct PeerHandle {
-    pub did: Did,
-    pub pubkey: PublicKey,
-    sender: Sender<Message>,
-    pub last_seen: Arc<Mutex<Instant>>,
-}
-
-impl PeerHandle {
-    fn send(&self, msg: Message) -> bool {
-        self.sender.send(msg).is_ok()
-    }
-
-    fn touch(&self) {
-        *self.last_seen.lock().unwrap() = Instant::now();
-    }
-}
-
-// ============================================================================
-// PERSISTENCE STATE
+// PERSISTENCE
 // ============================================================================
 
 #[derive(Serialize, Deserialize)]
-struct SavedState {
-    entries: HashMap<Cid, Entry>,
-    proposals: HashMap<Cid, Proposal>,
-    trust_scores: HashMap<Did, TrustScore>,
-    pruned_cids: HashSet<Cid>,
-    pubkeys: HashMap<Did, Vec<u8>>,
-}
-
-// ============================================================================
-// GOVERNANCE ACTOR
-// ============================================================================
-
-pub struct GovernanceActor {
-    identity: Arc<NodeIdentity>,
-    entries: RwLock<HashMap<Cid, Entry>>,
-    proposals: RwLock<HashMap<Cid, Proposal>>,
-    known_pubkeys: RwLock<HashMap<Did, PublicKey>>,
-    // Trust system
-    trust_scores: RwLock<HashMap<Did, TrustScore>>,
-    // Track pruned content to prevent re-addition
-    pruned_cids: RwLock<HashSet<Cid>>,
-    db_path: String,
-}
-
-impl GovernanceActor {
-    pub fn new(identity: Arc<NodeIdentity>, db_path: &str) -> Arc<Self> {
-        let actor = Arc::new(Self {
-            identity,
-            entries: RwLock::new(HashMap::new()),
-            proposals: RwLock::new(HashMap::new()),
-            known_pubkeys: RwLock::new(HashMap::new()),
-            trust_scores: RwLock::new(HashMap::new()),
-            pruned_cids: RwLock::new(HashSet::new()),
-            db_path: db_path.to_string(),
-        });
-        actor.load();
-        actor
-    }
-
-    fn load(&self) {
-        if let Ok(data) = std::fs::read(&self.db_path) {
-            match serde_cbor::from_slice::<SavedState>(&data) {
-                Ok(state) => {
-                    // Restore pubkeys first (needed for signature verification)
-                    let mut known = self.known_pubkeys.write().unwrap();
-                    for (did, pk_bytes) in state.pubkeys {
-                        if let Ok(pk) = PublicKey::from_bytes(&pk_bytes) {
-                            // Verify DID matches pubkey
-                            if Did::from_pubkey(&pk) == did {
-                                known.insert(did, pk);
-                            }
-                        }
-                    }
-                    drop(known);
-
-                    // Validate and restore entries
-                    let mut valid_entries = HashMap::new();
-                    for (cid, entry) in state.entries {
-                        // Verify CID matches content
-                        let expected_cid = Cid::from_entry_data(
-                            &entry.data, 
-                            entry.timestamp, 
-                            &entry.creator
-                        );
-                        if cid != expected_cid {
-                            eprintln!("[LOAD] Skipping entry with invalid CID: {}", cid.short());
-                            continue;
-                        }
-
-                        // Verify signature
-                        if !self.verify_signature(&entry.creator, &entry.data, &entry.signature) {
-                            eprintln!("[LOAD] Skipping entry with invalid signature: {}", cid.short());
-                            continue;
-                        }
-
-                        valid_entries.insert(cid, entry);
-                    }
-
-                    let entry_count = valid_entries.len();
-                    *self.entries.write().unwrap() = valid_entries;
-
-                    // Restore proposals (only if their entry exists)
-                    let entries = self.entries.read().unwrap();
-                    let mut valid_proposals = HashMap::new();
-                    for (cid, proposal) in state.proposals {
-                        if entries.contains_key(&cid) {
-                            valid_proposals.insert(cid, proposal);
-                        }
-                    }
-                    drop(entries);
-                    
-                    let proposal_count = valid_proposals.len();
-                    *self.proposals.write().unwrap() = valid_proposals;
-
-                    // Restore trust scores
-                    *self.trust_scores.write().unwrap() = state.trust_scores;
-
-                    // Restore pruned CIDs
-                    *self.pruned_cids.write().unwrap() = state.pruned_cids;
-
-                    println!(
-                        "[LOAD] Restored {} entries, {} proposals",
-                        entry_count, proposal_count
-                    );
-                }
-                Err(e) => {
-                    eprintln!("[LOAD] Failed to deserialize state: {}", e);
-                }
-            }
-        }
-    }
-
-    pub fn save(&self) -> io::Result<()> {
-        let pubkeys: HashMap<Did, Vec<u8>> = self
-            .known_pubkeys
-            .read()
-            .unwrap()
-            .iter()
-            .map(|(did, pk)| (did.clone(), pk.as_bytes().to_vec()))
-            .collect();
-
-        let state = SavedState {
-            entries: self.entries.read().unwrap().clone(),
-            proposals: self.proposals.read().unwrap().clone(),
-            trust_scores: self.trust_scores.read().unwrap().clone(),
-            pruned_cids: self.pruned_cids.read().unwrap().clone(),
-            pubkeys,
-        };
-
-        let temp = format!("{}.tmp.{}", self.db_path, std::process::id());
-        {
-            let file = File::create(&temp)?;
-            let mut writer = BufWriter::new(file);
-            serde_cbor::to_writer(&mut writer, &state)
-                .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
-            writer.flush()?;
-            let file = writer.into_inner()
-                .map_err(|e| io::Error::new(ErrorKind::Other, e.to_string()))?;
-            file.sync_all()?;
-        }
-        
-        #[cfg(windows)]
-        if Path::new(&self.db_path).exists() {
-            std::fs::remove_file(&self.db_path)?;
-        }
-        
-        std::fs::rename(&temp, &self.db_path)
-    }
-
-    pub fn register_pubkey(&self, did: Did, pubkey: PublicKey) {
-        self.known_pubkeys.write().unwrap().insert(did, pubkey);
-    }
-
-    pub fn has_pubkey(&self, did: &Did) -> bool {
-        self.known_pubkeys.read().unwrap().contains_key(did)
-    }
-
-    fn verify_signature(&self, did: &Did, data: &[u8], signature: &[u8]) -> bool {
-        let pubkeys = self.known_pubkeys.read().unwrap();
-        if let Some(pubkey) = pubkeys.get(did) {
-            return NodeIdentity::verify(data, signature, pubkey);
-        }
-        false
-    }
-
-    // ========== TRUST METHODS ==========
-
-    pub fn get_trust(&self, did: &Did) -> f64 {
-        self.trust_scores
-            .read()
-            .unwrap()
-            .get(did)
-            .map(|ts| ts.score)
-            .unwrap_or(INITIAL_TRUST)
-    }
-
-    fn update_trust(&self, did: &Did, elaboration: &str) {
-        let mut scores = self.trust_scores.write().unwrap();
-        let ts = scores.entry(did.clone()).or_insert_with(TrustScore::new);
-        ts.update_from_elaboration(elaboration);
-    }
-
-    pub fn can_propose(&self, did: &Did) -> bool {
-        self.get_trust(did) >= MIN_TRUST_FOR_PROPOSALS
-    }
-
-    // ========== ENTRY METHODS ==========
-
-    pub fn create_entry(&self, entry_type: EntryType) -> Entry {
-        let data = bincode::serialize(&entry_type).unwrap();
-        let timestamp = current_timestamp();
-        let cid = Cid::from_entry_data(&data, timestamp, &self.identity.did);
-        let signature = self.identity.sign(&data);
-
-        Entry {
-            cid,
-            entry_type,
-            data,
-            creator: self.identity.did.clone(),
-            timestamp,
-            signature,
-        }
-    }
-
-    pub fn add_entry(&self, entry: Entry, peer_count: usize) -> Result<Cid, &'static str> {
-        // Check if this CID was pruned
-        if self.pruned_cids.read().unwrap().contains(&entry.cid) {
-            return Err("Entry was pruned by democratic vote");
-        }
-
-        // Check duplicate
-        if self.entries.read().unwrap().contains_key(&entry.cid) {
-            return Err("Entry already exists");
-        }
-
-        // Validate timestamp
-        validate_timestamp(entry.timestamp)?;
-
-        // Validate data size
-        if entry.data.len() > MAX_ENTRY_DATA_SIZE {
-            return Err("Entry data too large");
-        }
-
-        // Verify CID matches content
-        let expected_cid = Cid::from_entry_data(&entry.data, entry.timestamp, &entry.creator);
-        if entry.cid != expected_cid {
-            return Err("Cid mismatch - content hash invalid");
-        }
-
-        // Verify signature
-        if !self.verify_signature(&entry.creator, &entry.data, &entry.signature) {
-            return Err("Invalid signature - cannot verify creator");
-        }
-
-        // Deserialize and validate entry type
-        let parsed_type: EntryType = bincode::deserialize(&entry.data)
-            .map_err(|_| "Malformed entry data")?;
-
-        let cid = entry.cid;
-
-        // Handle votable entry types
-        match &parsed_type {
-            EntryType::Proposal { text } => {
-                validate_elaboration(text)?;
-                let threshold = ((peer_count + 1) as f64 * 0.67).ceil() as i32;
-                self.proposals.write().unwrap().insert(cid, Proposal {
-                    cid,
-                    entry_type: parsed_type.clone(),
-                    proposer: entry.creator.clone(),
-                    elaboration: text.clone(),
-                    votes_for: HashMap::new(),
-                    votes_against: HashMap::new(),
-                    threshold: threshold.max(1),
-                    executed: false,
-                });
-            }
-            EntryType::Prune { target, reason } => {
-                // Verify target exists
-                if !self.entries.read().unwrap().contains_key(target) {
-                    return Err("Prune target does not exist");
-                }
-                validate_elaboration(reason)?;
-                let threshold = ((peer_count + 1) as f64 * 0.67).ceil() as i32;
-                self.proposals.write().unwrap().insert(cid, Proposal {
-                    cid,
-                    entry_type: parsed_type.clone(),
-                    proposer: entry.creator.clone(),
-                    elaboration: reason.clone(),
-                    votes_for: HashMap::new(),
-                    votes_against: HashMap::new(),
-                    threshold: threshold.max(1),
-                    executed: false,
-                });
-            }
-            EntryType::Knowledge { .. } => {
-                // Knowledge entries are content, not votable proposals
-            }
-        }
-
-        self.entries.write().unwrap().insert(cid, entry);
-        Ok(cid)
-    }
-
-    pub fn vote(
-        &self,
-        voter: &Did,
-        target: Cid,
-        support: bool,
-        elaboration: String,
-        signature: &[u8],
-    ) -> Result<bool, &'static str> {
-        // Validate elaboration
-        validate_elaboration(&elaboration)?;
-
-        // Verify vote signature
-        let vote_data = bincode::serialize(&(&target, support, &elaboration))
-            .map_err(|_| "Serialize error")?;
-
-        if !self.verify_signature(voter, &vote_data, signature) {
-            return Err("Invalid vote signature");
-        }
-
-        // Process vote
-        let mut proposals = self.proposals.write().unwrap();
-        let proposal = proposals.get_mut(&target).ok_or("Proposal not found")?;
-
-        if proposal.executed {
-            return Err("Proposal already executed");
-        }
-
-        if proposal.votes_for.contains_key(voter) || proposal.votes_against.contains_key(voter) {
-            return Err("Already voted");
-        }
-
-        if support {
-            proposal.votes_for.insert(voter.clone(), elaboration.clone());
-        } else {
-            proposal.votes_against.insert(voter.clone(), elaboration.clone());
-        }
-
-        // Update voter's trust based on elaboration quality
-        drop(proposals);
-        self.update_trust(voter, &elaboration);
-
-        // Check threshold
-        let mut proposals = self.proposals.write().unwrap();
-        let proposal = proposals.get_mut(&target).unwrap();
-
-        if proposal.votes_for.len() as i32 >= proposal.threshold {
-            proposal.executed = true;
-            let entry_type = proposal.entry_type.clone();
-            drop(proposals);
-            
-            // Execute based on entry type
-            self.execute_proposal(target, entry_type);
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
-    fn execute_proposal(&self, _cid: Cid, entry_type: EntryType) {
-        match entry_type {
-            EntryType::Prune { target, reason } => {
-                println!(
-                    "[EXECUTE] Pruning {} - {}",
-                    target.short(),
-                    &reason[..reason.len().min(50)]
-                );
-                // Remove the entry
-                self.entries.write().unwrap().remove(&target);
-                // Mark as pruned to prevent re-addition
-                self.pruned_cids.write().unwrap().insert(target);
-            }
-            EntryType::Proposal { text } => {
-                println!(
-                    "[EXECUTE] Proposal passed: {}",
-                    &text[..text.len().min(50)]
-                );
-            }
-            EntryType::Knowledge { category, concept, .. } => {
-                println!("[EXECUTE] Knowledge: {} > {}", category, concept);
-            }
-        }
-    }
-
-    pub fn known_cids(&self) -> Vec<Cid> {
-        self.entries.read().unwrap().keys().copied().collect()
-    }
-
-    pub fn entries_not_in(&self, known: &[Cid]) -> Vec<Entry> {
-        let known_set: HashSet<_> = known.iter().collect();
-        self.entries
-            .read()
-            .unwrap()
-            .values()
-            .filter(|e| !known_set.contains(&e.cid))
-            .cloned()
-            .collect()
-    }
-
-    pub fn entry_count(&self) -> usize {
-        self.entries.read().unwrap().len()
-    }
-
-    pub fn proposal_count(&self) -> usize {
-        self.proposals.read().unwrap().len()
-    }
-
-    pub fn find_proposal_cid(&self, prefix: &str) -> Option<Cid> {
-        self.proposals
-            .read()
-            .unwrap()
-            .keys()
-            .find(|c| c.short().starts_with(prefix))
-            .copied()
-    }
-
-    pub fn find_entry_cid(&self, prefix: &str) -> Option<Cid> {
-        self.entries
-            .read()
-            .unwrap()
-            .keys()
-            .find(|c| c.short().starts_with(prefix))
-            .copied()
-    }
-}
-
-// ============================================================================
-// PEER CONNECTION ACTOR
-// ============================================================================
-
-struct PeerConnectionActor {
-    stream: TcpStream,
-    peer_did: Did,
-    outbound: Receiver<Message>,
-    on_message: Sender<(Did, Message)>,
-    running: Arc<AtomicBool>,
-}
-
-impl PeerConnectionActor {
-    fn run(mut self) {
-        if self.stream.set_nonblocking(false).is_err() {
-            return;
-        }
-        if self.stream.set_read_timeout(Some(Duration::from_secs(1))).is_err() {
-            return;
-        }
-        if self.stream.set_write_timeout(Some(Duration::from_secs(5))).is_err() {
-            return;
-        }
-
-        let mut last_heartbeat = Instant::now();
-
-        while self.running.load(Ordering::Relaxed) {
-            // Send outbound messages
-            loop {
-                match self.outbound.try_recv() {
-                    Ok(msg) => {
-                        if write_msg(&mut self.stream, &msg).is_err() {
-                            println!("[PEER] Write error to {}", self.peer_did.short());
-                            return;
-                        }
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => return,
-                }
-            }
-
-            // Periodic heartbeat
-            if last_heartbeat.elapsed() > Duration::from_secs(HEARTBEAT_SECS) {
-                if write_msg(&mut self.stream, &Message::Heartbeat).is_err() {
-                    return;
-                }
-                last_heartbeat = Instant::now();
-            }
-
-            // Read inbound
-            match read_msg(&mut self.stream) {
-                Ok(msg) => {
-                    if self.on_message.send((self.peer_did.clone(), msg)).is_err() {
-                        return;
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                    continue;
-                }
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                    println!("[PEER] {} disconnected", self.peer_did.short());
-                    return;
-                }
-                Err(e) => {
-                    let is_connection_error = e.raw_os_error()
-                        .map(|c| c == 10053 || c == 10054)
-                        .unwrap_or(false);
-                    if !is_connection_error || self.running.load(Ordering::Relaxed) {
-                        println!("[PEER] Read error from {}: {}", self.peer_did.short(), e);
-                    }
-                    return;
-                }
-            }
-        }
-    }
+struct PersistedState {
+    identity: (Vec<u8>, Vec<u8>, Did),
+    expressions: Vec<(Cid, Vec<u8>)>,
+    proposals: Vec<(Cid, ProposalState)>,
+    pool_proposals: Vec<([u8; 32], PoolState)>,
+    active_pools: Vec<[u8; 32]>,
+    marks: Vec<(Did, EpigeneticMark)>,
+    nonce_counter: u64,
 }
 
 // ============================================================================
@@ -948,1248 +786,1074 @@ impl PeerConnectionActor {
 // ============================================================================
 
 pub struct Node {
-    pub identity: Arc<NodeIdentity>,
-    pub governance: Arc<GovernanceActor>,
-    peers: RwLock<HashMap<Did, PeerHandle>>,
-    listener: RwLock<Option<TcpListener>>,
+    did: Did,
+    secret_key: SecretKey,
+    public_key: PublicKey,
+    listener: Arc<RwLock<Option<TcpListener>>>,
+    bind_addr: String,
+    pool: Arc<RwLock<Option<[u8; 32]>>>,
+    connection_pool: ConnectionPool,
+    reconnect_queue: Arc<RwLock<VecDeque<(SocketAddr, Instant, u32)>>>,
+    store: Arc<RwLock<ExprStore>>,
+    state: Arc<RwLock<DerivedState>>,
     running: Arc<AtomicBool>,
-    msg_rx: Mutex<Option<Receiver<(Did, Message)>>>,
-    msg_tx: Sender<(Did, Message)>,
+    db_path: String,
+    weak_self: Arc<Mutex<Option<Weak<Node>>>>,
 }
 
 impl Node {
-    pub fn new(addr: &str, pool: &str) -> io::Result<Arc<Self>> {
-        let addr_hash = hex::encode(&sha256(addr.as_bytes())[..8]);
-        Self::new_with_paths(addr, pool, &format!("db/{}", addr_hash))
-    }
-
-    pub fn new_with_paths(addr: &str, pool: &str, db_path: &str) -> io::Result<Arc<Self>> {
+    pub fn new(bind_addr: &str, db_path: &str) -> Result<Arc<Self>> {
         std::fs::create_dir_all(db_path).ok();
-
-        let identity = Arc::new(NodeIdentity::load_or_create(
-            &format!("{}/identity.cbor", db_path),
-            pool,
-        )?);
-
-        let governance = GovernanceActor::new(
-            Arc::clone(&identity),
-            &format!("{}/governance.cbor", db_path),
-        );
-
-        // Register own pubkey
-        governance.register_pubkey(identity.did.clone(), identity.public_key.clone());
-
-        let listener = TcpListener::bind(addr)?;
+        let listener = TcpListener::bind(bind_addr)?;
         listener.set_nonblocking(true)?;
-
-        let (msg_tx, msg_rx) = mpsc::channel();
-
+        
+        let persistence_path = format!("{}/state.cbor", db_path);
+        let (did, secret_key, public_key, store, state, nonce) = Self::load_or_create(&persistence_path)?;
+        NONCE_COUNTER.store(nonce, Ordering::Relaxed);
+        
         let node = Arc::new(Self {
-            identity,
-            governance,
-            peers: RwLock::new(HashMap::new()),
-            listener: RwLock::new(Some(listener)),
+            did: did.clone(), secret_key, public_key,
+            listener: Arc::new(RwLock::new(Some(listener))),
+            bind_addr: bind_addr.to_string(),
+            pool: Arc::new(RwLock::new(None)),
+            connection_pool: ConnectionPool::new(),
+            reconnect_queue: Arc::new(RwLock::new(VecDeque::new())),
+            store: Arc::new(RwLock::new(store)),
+            state: Arc::new(RwLock::new(state)),
             running: Arc::new(AtomicBool::new(true)),
-            msg_rx: Mutex::new(Some(msg_rx)),
-            msg_tx,
+            db_path: db_path.to_string(),
+            weak_self: Arc::new(Mutex::new(None)),
         });
-
-        println!("[NODE] {} listening on {}", node.identity.did.short(), addr);
-        println!("[NODE] Pool: {}", hex::encode(&node.identity.pool_commitment[..8]));
-        println!("[NODE] Trust: {:.2}", node.governance.get_trust(&node.identity.did));
-
-        let n = Arc::clone(&node);
-        thread::spawn(move || n.accept_loop());
-
-        let n = Arc::clone(&node);
-        thread::spawn(move || n.message_loop());
-
-        let n = Arc::clone(&node);
-        thread::spawn(move || n.maintenance_loop());
-
+        
+        *node.weak_self.lock().unwrap() = Some(Arc::downgrade(&node));
+        
+        println!("🧬 DIAGON v0.9.0 - Biological Consensus Machine");
+        println!("   \"Consensus on expressions, derivation of truth\"");
+        println!();
+        println!("🔑 DID: {}", did.0);
+        println!("📡 Listening: {}", bind_addr);
+        println!("🗄️  Database: {}", db_path);
+        println!();
+        
+        let n = Arc::clone(&node); thread::spawn(move || Self::accept_loop(n));
+        let n = Arc::clone(&node); thread::spawn(move || Self::heartbeat_loop(n));
+        let n = Arc::clone(&node); thread::spawn(move || Self::sync_loop(n));
+        let n = Arc::clone(&node); thread::spawn(move || Self::reconnect_loop(n));
+        
         Ok(node)
     }
-
-    pub fn connect(&self, addr: &str) -> io::Result<()> {
-        let socket_addr: SocketAddr = addr
-            .parse()
-            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "Invalid address"))?;
-
-        let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(AUTH_TIMEOUT_SECS))?;
-        stream.set_nonblocking(false)?;
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(Duration::from_secs(AUTH_TIMEOUT_SECS)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(AUTH_TIMEOUT_SECS)))?;
-
-        write_msg(
-            &mut stream,
-            &Message::Connect {
-                did: self.identity.did.clone(),
-                pubkey: self.identity.public_key.as_bytes().to_vec(),
-                pool: self.identity.pool_commitment,
-            },
-        )?;
-
-        let (nonce, server_did, server_pubkey) = match read_msg(&mut stream)? {
-            Message::Challenge {
-                nonce,
-                server_did,
-                server_sig,
-                server_pubkey,
-            } => {
-                let pk = PublicKey::from_bytes(&server_pubkey)
-                    .map_err(|_| io::Error::new(ErrorKind::InvalidData, "Invalid server pubkey"))?;
-
-                if Did::from_pubkey(&pk) != server_did {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "Server DID mismatch"));
+    
+    fn load_or_create(path: &str) -> Result<(Did, SecretKey, PublicKey, ExprStore, DerivedState, u64)> {
+        if let Ok(file) = File::open(path) {
+            if let Ok(persisted) = serde_cbor::from_reader::<PersistedState, _>(BufReader::new(file)) {
+                if let (Ok(pk), Ok(sk)) = (PublicKey::from_bytes(&persisted.identity.0), SecretKey::from_bytes(&persisted.identity.1)) {
+                    let did = Did::from_pubkey(&pk);
+                    if did == persisted.identity.2 {
+                        let mut store = ExprStore::new();
+                        for (_cid, data) in persisted.expressions { if let Some(expr) = store.arena_mut().deserialize(&data) { store.store(expr); } }
+                        let mut state = DerivedState::new();
+                        for (cid, prop) in persisted.proposals { state.proposals.insert(cid, prop); }
+                        for (commitment, pool) in persisted.pool_proposals { state.pool_proposals.insert(commitment, pool); }
+                        for pool in persisted.active_pools { state.active_pools.insert(pool); }
+                        for (did, mark) in persisted.marks { state.marks.insert(did, mark); }
+                        println!("📥 Loaded {} expressions, {} proposals", store.log().len(), state.proposals.len());
+                        return Ok((did, sk, pk, store, state, persisted.nonce_counter));
+                    }
                 }
-
-                let challenge_data = [CHALLENGE_DOMAIN, &nonce, server_did.0.as_bytes()].concat();
-                if !NodeIdentity::verify(&challenge_data, &server_sig, &pk) {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "Invalid server signature"));
-                }
-
-                (nonce, server_did, pk)
             }
-            Message::Rejected => {
-                return Err(io::Error::new(ErrorKind::PermissionDenied, "Rejected"))
-            }
-            _ => {
-                return Err(io::Error::new(ErrorKind::InvalidData, "Expected Challenge"))
-            }
+        }
+        let (public_key, secret_key) = keypair();
+        let did = Did::from_pubkey(&public_key);
+        Ok((did, secret_key, public_key, ExprStore::new(), DerivedState::new(), 0))
+    }
+    
+    fn save_state(&self) -> Result<()> {
+        let store = self.store.read().unwrap();
+        let state = self.state.read().unwrap();
+        let expressions: Vec<_> = store.log().iter().filter_map(|cid| store.serialize_expr(cid).map(|data| (*cid, data))).collect();
+        let persisted = PersistedState {
+            identity: (self.public_key.as_bytes().to_vec(), self.secret_key.as_bytes().to_vec(), self.did.clone()),
+            expressions,
+            proposals: state.proposals.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            pool_proposals: state.pool_proposals.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            active_pools: state.active_pools.iter().cloned().collect(),
+            marks: state.marks.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            nonce_counter: NONCE_COUNTER.load(Ordering::Relaxed),
         };
-
-        let response_data = [CHALLENGE_DOMAIN, &nonce, self.identity.did.0.as_bytes()].concat();
-        let signature = self.identity.sign(&response_data);
-        let elaboration = format!(
-            "Connecting to {} at timestamp {} to participate in democratic governance",
-            server_did.short(),
-            current_timestamp()
-        );
-
-        write_msg(
-            &mut stream,
-            &Message::Response {
-                signature,
-                elaboration,
-            },
-        )?;
-
-        match read_msg(&mut stream)? {
-            Message::Authenticated { peer_did } => {
-                if peer_did != server_did {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "Server DID mismatch in auth"));
-                }
-
-                println!("[CONNECT] Authenticated with {}", peer_did.short());
-                self.register_peer(stream, server_did.clone(), server_pubkey);
-
-                let known_cids = self.governance.known_cids();
-                if let Some(peer) = self.peers.read().unwrap().get(&server_did) {
-                    peer.send(Message::SyncRequest { known_cids });
-                }
-
-                Ok(())
-            }
-            Message::Rejected => Err(io::Error::new(ErrorKind::PermissionDenied, "Auth rejected")),
-            _ => Err(io::Error::new(ErrorKind::InvalidData, "Expected Authenticated")),
+        let temp = format!("{}/state.cbor.tmp", self.db_path);
+        let path = format!("{}/state.cbor", self.db_path);
+        serde_cbor::to_writer(BufWriter::new(File::create(&temp)?), &persisted).map_err(|e| DiagonError::Serialization(e.to_string()))?;
+        std::fs::rename(temp, path)?;
+        Ok(())
+    }
+    
+    fn sign(&self, data: &[u8]) -> Vec<u8> { detached_sign(data, &self.secret_key).as_bytes().to_vec() }
+    
+    fn verify(&self, data: &[u8], signature: &[u8], pubkey: &[u8]) -> Result<()> {
+        let pk = PublicKey::from_bytes(pubkey).map_err(|_| DiagonError::Crypto("Invalid public key".into()))?;
+        let sig = DetachedSignature::from_bytes(signature).map_err(|_| DiagonError::Crypto("Invalid signature".into()))?;
+        verify_detached_signature(&sig, data, &pk).map_err(|_| DiagonError::Crypto("Verification failed".into()))
+    }
+    
+    pub fn auth(&self, passphrase: &str) -> bool {
+        let commitment = sha256(passphrase.as_bytes());
+        if self.state.read().unwrap().active_pools.contains(&commitment) {
+            *self.pool.write().unwrap() = Some(commitment);
+            println!("✔ Pool authenticated: {}", hex::encode(&commitment[..8]));
+            true
+        } else {
+            println!("✗ Unknown pool. Commitment: {}", hex::encode(&commitment[..8]));
+            false
         }
     }
-
-    fn accept_loop(self: &Arc<Self>) {
-        while self.running.load(Ordering::Relaxed) {
-            let listener_guard = self.listener.read().unwrap();
+    
+    pub fn connect(&self, addr_str: &str) -> Result<()> {
+        let pool = self.pool.read().unwrap().ok_or_else(|| DiagonError::Validation("Set pool first with 'auth'".into()))?;
+        let addr: SocketAddr = addr_str.parse().map_err(|_| DiagonError::Validation("Invalid address".into()))?;
+        if self.connection_pool.get(&addr).is_some() { println!("Already connected to {}", addr); return Ok(()); }
+        
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+            Ok(stream) => {
+                let conn = Arc::new(TcpConnection::new(stream, addr, true)?);  // we initiated
+                *conn.state.write().unwrap() = ConnectionState::Authenticating;
+                let store = self.store.read().unwrap();
+                let msg = NetMessage::Hello { did: self.did.clone(), pubkey: self.public_key.as_bytes().to_vec(), pool, expr_root: store.merkle_root() };
+                conn.send(&msg.serialize()?)?;
+                self.connection_pool.add(addr, Arc::clone(&conn))?;
+                let node_weak = self.weak_self.lock().unwrap().clone().unwrap();
+                let handle = thread::spawn(move || Self::reader_loop(node_weak, conn, addr));
+                self.connection_pool.add_reader(addr, handle);
+                println!("→ Connecting to {}", addr);
+                Ok(())
+            }
+            Err(e) => { self.reconnect_queue.write().unwrap().push_back((addr, Instant::now(), 0)); Err(DiagonError::Io(e)) }
+        }
+    }
+    
+    pub fn elaborate(&self, text: &str) {
+        if text.len() < MIN_ELABORATION_LEN { println!("✗ Elaboration too short (min {} chars)", MIN_ELABORATION_LEN); return; }
+        let awaiting = self.connection_pool.awaiting_elaboration();
+        if awaiting.is_empty() { println!("No peers awaiting elaboration"); return; }
+        let sig = self.sign(text.as_bytes());
+        let msg = NetMessage::Elaborate { text: text.to_string(), signature: sig };
+        let data = match msg.serialize() { Ok(d) => d, Err(_) => return };
+        for (addr, conn) in awaiting {
+            if conn.send(&data).is_ok() {
+                *conn.elaboration.write().unwrap() = Some(text.to_string());
+                *conn.state.write().unwrap() = ConnectionState::PendingApproval;
+                println!("→ Elaboration sent to {}", addr);
+            }
+        }
+    }
+    
+    pub fn approve(&self, id: &str) {
+        for (addr, conn) in self.connection_pool.pending_approval() {
+            let did_match = conn.did.read().unwrap().as_ref().map(|d| d.short().contains(id) || d.0.contains(id)).unwrap_or(false);
+            let addr_match = addr.to_string().contains(id);
+            if did_match || addr_match {
+                let sig = self.sign(b"approve");
+                if let Ok(data) = (NetMessage::Approve { signature: sig }).serialize() {
+                    if conn.send(&data).is_ok() {
+                        *conn.state.write().unwrap() = ConnectionState::Connected;
+                        if let Some(did) = conn.did.read().unwrap().as_ref() {
+                            println!("✓ Peer {} approved", did.short());
+                            if let Some(elab) = conn.elaboration.read().unwrap().as_ref() {
+                                self.state.write().unwrap().update_mark(did, score_elaboration(elab));
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        println!("Peer not found or not pending approval");
+    }
+    
+    pub fn reject(&self, id: &str, reason: &str) {
+        for (addr, conn) in self.connection_pool.pending_approval() {
+            let did_match = conn.did.read().unwrap().as_ref().map(|d| d.short().contains(id)).unwrap_or(false);
+            if did_match || addr.to_string().contains(id) {
+                let sig = self.sign(reason.as_bytes());
+                if let Ok(data) = (NetMessage::Reject { reason: reason.to_string(), signature: sig }).serialize() { conn.send(&data).ok(); }
+                self.connection_pool.remove(addr);
+                println!("✗ Peer rejected: {}", reason);
+                return;
+            }
+        }
+        println!("Peer not found");
+    }
+    
+    pub fn propose(&self, text: &str) {
+        if text.len() < MIN_ELABORATION_LEN { println!("✗ Proposal too short"); return; }
+        let trust = self.state.read().unwrap().get_mark(&self.did).current_score();
+        if trust < TRUST_MIN_FOR_PROPOSE { println!("✗ Insufficient trust: {:.2} < {:.2}", trust, TRUST_MIN_FOR_PROPOSE); return; }
+        
+        let mut store = self.store.write().unwrap();
+        let op = store.arena_mut().atom("propose");
+        let t = store.arena_mut().atom(text);
+        let e = store.arena_mut().atom(text);
+        let expr = store.arena_mut().list(&[op, t, e]);
+        let expr_data = store.arena().serialize(expr);
+        let sig = self.sign(&expr_data);
+        let signed_op = store.arena_mut().atom("signed");
+        let pk_ref = store.arena_mut().bytes(self.public_key.as_bytes());
+        let sig_ref = store.arena_mut().bytes(&sig);
+        let signed_expr = store.arena_mut().list(&[signed_op, pk_ref, sig_ref, expr]);
+        let (cid, _) = store.store(signed_expr);
+        let expr_bytes = store.arena().serialize(signed_expr);
+        drop(store);
+        
+        let peer_count = self.connection_pool.authenticated_addrs().len();
+        let threshold = self.state.read().unwrap().threshold(peer_count);
+        let proposal = ProposalState { cid, expr_data: expr_bytes.clone(), proposer: self.did.clone(), elaboration: text.to_string(), quorum: QuorumState::new(cid, threshold), executed: false, created: timestamp() };
+        self.state.write().unwrap().proposals.insert(cid, proposal);
+        let _ = self.save_state();
+        println!("[PROPOSE] {}", cid);
+        self.broadcast_authenticated(&NetMessage::Expression(expr_bytes));
+    }
+    
+    pub fn vote(&self, cid_prefix: &str, support: bool, elaboration: &str) {
+        if elaboration.len() < MIN_ELABORATION_LEN { println!("✗ Elaboration too short"); return; }
+        let cid = match self.state.read().unwrap().proposals.keys().find(|c| c.short().starts_with(cid_prefix)).copied() {
+            Some(c) => c, None => { println!("✗ Proposal not found"); return; }
+        };
+        
+        let mut store = self.store.write().unwrap();
+        let op = store.arena_mut().atom("vote");
+        let target = store.arena_mut().bytes(&cid.0);
+        let sup = store.arena_mut().atom(if support { "yes" } else { "no" });
+        let elab = store.arena_mut().atom(elaboration);
+        let expr = store.arena_mut().list(&[op, target, sup, elab]);
+        let expr_data = store.arena().serialize(expr);
+        let sig = self.sign(&expr_data);
+        let signed_op = store.arena_mut().atom("signed");
+        let pk_ref = store.arena_mut().bytes(self.public_key.as_bytes());
+        let sig_ref = store.arena_mut().bytes(&sig);
+        let signed_expr = store.arena_mut().list(&[signed_op, pk_ref, sig_ref, expr]);
+        let (_vote_cid, _) = store.store(signed_expr);
+        let vote_bytes = store.arena().serialize(signed_expr);
+        drop(store);
+        
+        let mark = self.state.read().unwrap().get_mark(&self.did);
+        let signal = QuorumSignal { source: self.did.clone(), target: cid, weight: mark.signal_weight(), support, elaboration: elaboration.to_string(), timestamp: timestamp(), signature: self.sign(&bincode::serialize(&(&cid, support, elaboration)).unwrap()) };
+        
+        {
+            let (sensed, reached) = {
+                let mut state = self.state.write().unwrap();
+                if let Some(proposal) = state.proposals.get_mut(&cid) {
+                    let sensed = proposal.quorum.sense(signal.clone());
+                    let reached = sensed && proposal.quorum.reached() && !proposal.executed;
+                    if reached { proposal.executed = true; }
+                    (sensed, reached)
+                } else { (false, false) }
+            };
+            if sensed {
+                self.state.write().unwrap().update_mark(&self.did, score_elaboration(elaboration));
+                if reached { println!("[QUORUM] {} reached threshold!", cid); }
+            }
+        }
+        let _ = self.save_state();
+        println!("[VOTE] {} on {}", if support { "YES" } else { "NO" }, cid);
+        self.broadcast_authenticated(&NetMessage::Expression(vote_bytes));
+        self.broadcast_authenticated(&NetMessage::Signal(signal));
+    }
+    
+    pub fn propose_pool(&self, phrase: &str, rationale: &str) {
+        let commitment = sha256(phrase.as_bytes());
+        let hint = if phrase.len() > 8 { format!("{}...{}", &phrase[..4], &phrase[phrase.len()-4..]) } else { phrase.to_string() };
+        let state = self.state.read().unwrap();
+        if state.active_pools.contains(&commitment) { println!("✗ Pool already active"); return; }
+        if state.pool_proposals.contains_key(&commitment) { println!("✗ Proposal already exists"); return; }
+        drop(state);
+        let peer_count = self.connection_pool.authenticated_addrs().len();
+        let threshold = self.state.read().unwrap().threshold(peer_count);
+        let pool = PoolState { commitment, hint, rationale: rationale.to_string(), proposer: self.did.clone(), quorum: QuorumState::new(Cid(commitment), threshold), active: false };
+        self.state.write().unwrap().pool_proposals.insert(commitment, pool);
+        let _ = self.save_state();
+        println!("[POOL-PROPOSE] {}", hex::encode(&commitment[..8]));
+    }
+    
+    pub fn vote_pool(&self, id: &str, support: bool, elaboration: &str) {
+        if elaboration.len() < MIN_ELABORATION_LEN { println!("✗ Elaboration too short"); return; }
+        let commitment = match self.state.read().unwrap().pool_proposals.keys().find(|c| hex::encode(&c[..8]).starts_with(id)).copied() {
+            Some(c) => c, None => { println!("✗ Pool proposal not found"); return; }
+        };
+        let mark = self.state.read().unwrap().get_mark(&self.did);
+        let signal = QuorumSignal { source: self.did.clone(), target: Cid(commitment), weight: mark.signal_weight(), support, elaboration: elaboration.to_string(), timestamp: timestamp(), signature: self.sign(elaboration.as_bytes()) };
+        let mut state = self.state.write().unwrap();
+        if let Some(pool) = state.pool_proposals.get_mut(&commitment) {
+            if pool.quorum.sense(signal) && pool.quorum.reached() && !pool.active {
+                pool.active = true; state.active_pools.insert(commitment);
+                println!("[POOL] {} activated!", hex::encode(&commitment[..8]));
+            }
+        }
+        drop(state); let _ = self.save_state();
+        println!("[POOL-VOTE] {} on {}", if support { "YES" } else { "NO" }, hex::encode(&commitment[..8]));
+    }
+    
+    pub fn status(&self) {
+        let state = self.state.read().unwrap();
+        let store = self.store.read().unwrap();
+        let pool = self.pool.read().unwrap();
+        let auth_count = self.connection_pool.authenticated_addrs().len();
+        let pending = self.connection_pool.pending_approval().len();
+        let awaiting = self.connection_pool.awaiting_elaboration().len();
+        println!();
+        println!("=== DIAGON STATUS ===");
+        println!("🔑 DID: {}", self.did.short());
+        println!("🏊 Pool: {}", pool.map(|p| hex::encode(&p[..8])).unwrap_or_else(|| "Not set".to_string()));
+        println!("📝 Expressions: {}", store.log().len());
+        println!("📋 Proposals: {}", state.proposals.len());
+        println!("🏊 Active pools: {}", state.active_pools.len());
+        println!("🔗 Peers: {} auth, {} pending, {} awaiting", auth_count, pending, awaiting);
+        if !state.proposals.is_empty() {
+            println!();
+            println!("Proposals:");
+            for (cid, prop) in state.proposals.iter().take(10) {
+                let status = if prop.executed { "✓" } else { "○" };
+                let text = if prop.elaboration.len() > 40 { format!("{}...", &prop.elaboration[..40]) } else { prop.elaboration.clone() };
+                println!("  {} {} - \"{}\" ({}/{})", status, cid.short(), text, prop.quorum.accumulated_for(), prop.quorum.threshold);
+            }
+        }
+        let conns = self.connection_pool.connections.read().unwrap();
+        if !conns.is_empty() {
+            println!();
+            println!("Connections:");
+            for (addr, conn) in conns.iter() {
+                let did_str = conn.did.read().unwrap().as_ref().map(|d| d.short()).unwrap_or_else(|| "?".to_string());
+                let state_str = match *conn.state.read().unwrap() { ConnectionState::Connected => "auth", ConnectionState::PendingApproval => "pending", ConnectionState::AwaitingElaboration => "awaiting", s => &format!("{:?}", s).to_lowercase() };
+                println!("  {} @ {} ({})", did_str, addr, state_str);
+            }
+        }
+        println!();
+    }
+    
+    pub fn list_pools(&self) {
+        let state = self.state.read().unwrap();
+        println!();
+        println!("=== ACTIVE POOLS ===");
+        for (i, pool) in state.active_pools.iter().enumerate() {
+            println!("  #{} {} {}", i + 1, hex::encode(&pool[..8]), if GENESIS_POOLS.contains(pool) { "[genesis]" } else { "[dynamic]" });
+        }
+        if !state.pool_proposals.is_empty() {
+            println!();
+            println!("=== PENDING POOL PROPOSALS ===");
+            for (commitment, pool) in &state.pool_proposals {
+                println!("  {} - \"{}\" ({}/{})", hex::encode(&commitment[..8]), if pool.rationale.len() > 40 { format!("{}...", &pool.rationale[..40]) } else { pool.rationale.clone() }, pool.quorum.accumulated_for(), pool.quorum.threshold);
+            }
+        }
+        println!();
+    }
+    
+    pub fn eval(&self, input: &str) {
+        let mut store = self.store.write().unwrap();
+        if let Some(expr) = store.arena_mut().parse(input) {
+            let (cid, is_new) = store.store(expr);
+            println!("Parsed: {}", store.arena().display(expr));
+            println!("CID: {} {}", cid, if is_new { "(new)" } else { "(exists)" });
+        } else { println!("Parse error"); }
+    }
+    
+    fn accept_loop(node: Arc<Node>) {
+        while node.running.load(Ordering::Relaxed) {
+            let listener_guard = node.listener.read().unwrap();
             if let Some(ref listener) = *listener_guard {
                 match listener.accept() {
-                    Ok((stream, addr)) => {
-                        drop(listener_guard);
-                        if let Err(e) = stream.set_nonblocking(false) {
-                            println!("[ACCEPT] Failed to set blocking: {}", e);
-                            continue;
-                        }
-                        let node = Arc::clone(self);
-                        thread::spawn(move || {
-                            if let Err(e) = node.handle_incoming(stream) {
-                                println!("[ACCEPT] {} failed: {}", addr, e);
-                            }
-                        });
-                    }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        drop(listener_guard);
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(e) => {
-                        drop(listener_guard);
-                        if self.running.load(Ordering::Relaxed) {
-                            println!("[ACCEPT] Error: {}", e);
-                        }
-                        thread::sleep(Duration::from_millis(10));
-                    }
+                    Ok((stream, addr)) => { drop(listener_guard); node.handle_incoming(stream, addr); }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => { drop(listener_guard); thread::sleep(Duration::from_millis(50)); }
+                    Err(_) => { drop(listener_guard); thread::sleep(Duration::from_millis(50)); }
                 }
-            } else {
-                break;
-            }
+            } else { break; }
         }
-        println!("[ACCEPT] Loop exiting");
     }
-
-    fn handle_incoming(&self, mut stream: TcpStream) -> io::Result<()> {
-        stream.set_nonblocking(false)?;
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(Duration::from_secs(AUTH_TIMEOUT_SECS)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(AUTH_TIMEOUT_SECS)))?;
-
-        let (peer_did, peer_pubkey) = match read_msg(&mut stream)? {
-            Message::Connect { did, pubkey, pool } => {
-                if !constant_time_compare(&pool, &self.identity.pool_commitment) {
-                    write_msg(&mut stream, &Message::Rejected)?;
-                    return Err(io::Error::new(ErrorKind::PermissionDenied, "Pool mismatch"));
-                }
-
-                let pk = PublicKey::from_bytes(&pubkey)
-                    .map_err(|_| io::Error::new(ErrorKind::InvalidData, "Invalid pubkey"))?;
-
-                if Did::from_pubkey(&pk) != did {
-                    write_msg(&mut stream, &Message::Rejected)?;
-                    return Err(io::Error::new(ErrorKind::InvalidData, "DID mismatch"));
-                }
-
-                (did, pk)
-            }
-            _ => {
-                return Err(io::Error::new(ErrorKind::InvalidData, "Expected Connect"));
-            }
-        };
-
-        let mut nonce = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        let challenge_data = [CHALLENGE_DOMAIN, &nonce, self.identity.did.0.as_bytes()].concat();
-        let server_sig = self.identity.sign(&challenge_data);
-
-        write_msg(
-            &mut stream,
-            &Message::Challenge {
-                nonce,
-                server_did: self.identity.did.clone(),
-                server_sig,
-                server_pubkey: self.identity.public_key.as_bytes().to_vec(),
-            },
-        )?;
-
-        match read_msg(&mut stream)? {
-            Message::Response { signature, elaboration } => {
-                let response_data = [CHALLENGE_DOMAIN, &nonce, peer_did.0.as_bytes()].concat();
-                if !NodeIdentity::verify(&response_data, &signature, &peer_pubkey) {
-                    write_msg(&mut stream, &Message::Rejected)?;
-                    return Err(io::Error::new(ErrorKind::PermissionDenied, "Invalid signature"));
-                }
-
-                if elaboration.len() < MIN_ELABORATION_LEN || elaboration.len() > MAX_ELABORATION_LEN {
-                    write_msg(&mut stream, &Message::Rejected)?;
-                    return Err(io::Error::new(ErrorKind::InvalidData, "Invalid elaboration"));
-                }
-
-                write_msg(&mut stream, &Message::Authenticated { peer_did: self.identity.did.clone() })?;
-
-                // Update trust from connection elaboration
-                self.governance.update_trust(&peer_did, &elaboration);
-
-                println!("[AUTH] {} authenticated", peer_did.short());
-                self.register_peer(stream, peer_did, peer_pubkey);
-                Ok(())
-            }
-            _ => {
-                write_msg(&mut stream, &Message::Rejected)?;
-                Err(io::Error::new(ErrorKind::InvalidData, "Expected Response"))
+    
+    fn handle_incoming(&self, stream: TcpStream, addr: SocketAddr) {
+        stream.set_nonblocking(false).ok();
+        if let Ok(conn) = TcpConnection::new(stream, addr, false) {  // they connected to us
+            let conn = Arc::new(conn);
+            *conn.state.write().unwrap() = ConnectionState::Authenticating;
+            if self.connection_pool.add(addr, Arc::clone(&conn)).is_ok() {
+                let node_weak = self.weak_self.lock().unwrap().clone().unwrap();
+                let handle = thread::spawn(move || Self::reader_loop(node_weak, conn, addr));
+                self.connection_pool.add_reader(addr, handle);
             }
         }
     }
-
-    fn register_peer(&self, stream: TcpStream, did: Did, pubkey: PublicKey) {
-        self.governance.register_pubkey(did.clone(), pubkey.clone());
-
-        let (tx, rx) = mpsc::channel();
-
-        let handle = PeerHandle {
-            did: did.clone(),
-            pubkey,
-            sender: tx,
-            last_seen: Arc::new(Mutex::new(Instant::now())),
-        };
-
-        self.peers.write().unwrap().insert(did.clone(), handle);
-
-        let actor = PeerConnectionActor {
-            stream,
-            peer_did: did,
-            outbound: rx,
-            on_message: self.msg_tx.clone(),
-            running: Arc::clone(&self.running),
-        };
-
-        thread::spawn(move || actor.run());
-    }
-
-    fn message_loop(&self) {
-        let rx = match self.msg_rx.lock().unwrap().take() {
-            Some(rx) => rx,
-            None => return,
-        };
-
-        while self.running.load(Ordering::Relaxed) {
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok((peer_did, msg)) => {
-                    if let Some(peer) = self.peers.read().unwrap().get(&peer_did) {
-                        peer.touch();
-                    }
-                    self.handle_message(peer_did, msg);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        println!("[MESSAGE] Loop exiting");
-    }
-
-    fn handle_message(&self, peer_did: Did, msg: Message) {
-        match msg {
-            Message::Propose { entry, elaboration } => {
-                if let Err(e) = validate_elaboration(&elaboration) {
-                    println!("[REJECT] Proposal from {}: {}", peer_did.short(), e);
-                    return;
-                }
-
-                if entry.creator != peer_did {
-                    println!("[REJECT] Creator mismatch from {}", peer_did.short());
-                    return;
-                }
-
-                let peer_count = self.peers.read().unwrap().len();
-                match self.governance.add_entry(entry.clone(), peer_count) {
-                    Ok(cid) => {
-                        println!("[PROPOSE] {} from {} (verified)", cid.short(), peer_did.short());
-                        // Update trust from elaboration
-                        self.governance.update_trust(&peer_did, &elaboration);
-                        self.broadcast_except(&peer_did, Message::NewEntry { entry });
-                    }
-                    Err(e) => {
-                        println!("[REJECT] Proposal from {}: {}", peer_did.short(), e);
-                    }
-                }
-            }
-
-            Message::Vote { voter, target, support, elaboration, signature } => {
-                if voter != peer_did {
-                    println!("[REJECT] Voter mismatch from {}", peer_did.short());
-                    return;
-                }
-
-                match self.governance.vote(&voter, target, support, elaboration, &signature) {
-                    Ok(executed) => {
-                        println!(
-                            "[VOTE] {} {} on {} (verified){}",
-                            if support { "YES" } else { "NO" },
-                            voter.short(),
-                            target.short(),
-                            if executed { " → EXECUTED" } else { "" }
-                        );
-                    }
-                    Err(e) => {
-                        println!("[REJECT] Vote from {}: {}", peer_did.short(), e);
-                    }
-                }
-            }
-
-            Message::NewEntry { entry } => {
-                if !self.governance.has_pubkey(&entry.creator) {
-                    println!("[REJECT] Unknown creator: {}", entry.creator.short());
-                    return;
-                }
-
-                let peer_count = self.peers.read().unwrap().len();
-                match self.governance.add_entry(entry.clone(), peer_count) {
-                    Ok(cid) => {
-                        println!("[ENTRY] {} from {} (verified)", cid.short(), entry.creator.short());
-                        self.broadcast_except(&peer_did, Message::NewEntry { entry });
-                    }
-                    Err(e) if e == "Entry already exists" => {}
-                    Err(e) => {
-                        println!("[REJECT] Entry: {}", e);
-                    }
-                }
-            }
-
-            Message::SyncRequest { known_cids } => {
-                let missing = self.governance.entries_not_in(&known_cids);
-                if let Some(peer) = self.peers.read().unwrap().get(&peer_did) {
-                    println!("[SYNC] Sending {} entries to {}", missing.len(), peer_did.short());
-                    peer.send(Message::SyncReply { entries: missing });
-                }
-            }
-
-            Message::SyncReply { entries } => {
-                let peer_count = self.peers.read().unwrap().len();
-                let mut added = 0;
-                for entry in entries {
-                    if self.governance.add_entry(entry, peer_count).is_ok() {
-                        added += 1;
-                    }
-                }
-                if added > 0 {
-                    println!("[SYNC] Added {} verified entries from {}", added, peer_did.short());
-                }
-            }
-
-            Message::Heartbeat => {}
-            _ => {}
-        }
-    }
-
-    pub fn broadcast(&self, msg: Message) {
-        let peers = self.peers.read().unwrap();
-        for peer in peers.values() {
-            peer.send(msg.clone());
-        }
-    }
-
-    fn broadcast_except(&self, exclude: &Did, msg: Message) {
-        let peers = self.peers.read().unwrap();
-        for (did, peer) in peers.iter() {
-            if did != exclude {
-                peer.send(msg.clone());
-            }
-        }
-    }
-
-    fn maintenance_loop(&self) {
-        while self.running.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_secs(30));
-
-            if !self.running.load(Ordering::Relaxed) {
-                break;
-            }
-
-            // Remove stale peers
-            let mut to_remove = Vec::new();
-            {
-                let peers = self.peers.read().unwrap();
-                for (did, peer) in peers.iter() {
-                    if peer.last_seen.lock().unwrap().elapsed() > Duration::from_secs(PEER_TIMEOUT_SECS) {
-                        to_remove.push(did.clone());
-                    }
-                }
-            }
-
-            if !to_remove.is_empty() {
-                let mut peers = self.peers.write().unwrap();
-                for did in to_remove {
-                    peers.remove(&did);
-                    println!("[CLEANUP] Removed stale peer {}", did.short());
-                }
-            }
-
-            if let Err(e) = self.governance.save() {
-                eprintln!("[PERSIST] Error: {}", e);
-            }
-        }
-        println!("[MAINTENANCE] Loop exiting");
-    }
-
-    // ========== PUBLIC API ==========
-
-    pub fn propose_knowledge(&self, category: &str, concept: &str, content: &str, elaboration: &str) {
-        if let Err(e) = validate_elaboration(elaboration) {
-            println!("[X] {}", e);
-            return;
-        }
-
-        let entry = self.governance.create_entry(EntryType::Knowledge {
-            category: category.to_string(),
-            concept: concept.to_string(),
-            content: content.to_string(),
-        });
-
-        let peer_count = self.peers.read().unwrap().len();
-        match self.governance.add_entry(entry.clone(), peer_count) {
-            Ok(cid) => {
-                println!("[KNOWLEDGE] Created {} (verified)", cid.short());
-                self.broadcast(Message::NewEntry { entry });
-            }
-            Err(e) => {
-                println!("[X] Failed: {}", e);
-            }
-        }
-    }
-
-    pub fn propose(&self, text: &str, elaboration: &str) {
-        if let Err(e) = validate_elaboration(elaboration) {
-            println!("[X] {}", e);
-            return;
-        }
-        
-        if let Err(e) = validate_elaboration(text) {
-            println!("[X] Proposal text: {}", e);
-            return;
-        }
-
-        // Trust check - democratic participation requires earned reputation
-        let trust = self.governance.get_trust(&self.identity.did);
-        if !self.governance.can_propose(&self.identity.did) {
-            println!(
-                "[X] Insufficient trust ({:.2} < {:.2}) - participate more to earn proposal rights",
-                trust,
-                MIN_TRUST_FOR_PROPOSALS
-            );
-            return;
-        }
-
-        let entry = self.governance.create_entry(EntryType::Proposal {
-            text: text.to_string(),
-        });
-
-        let peer_count = self.peers.read().unwrap().len();
-        match self.governance.add_entry(entry.clone(), peer_count) {
-            Ok(cid) => {
-                println!("[PROPOSE] Created {} (verified)", cid.short());
-                self.broadcast(Message::NewEntry { entry });
-            }
-            Err(e) => {
-                println!("[X] Failed: {}", e);
-            }
-        }
-    }
-
-    pub fn propose_prune(&self, target_prefix: &str, reason: &str) {
-        if let Err(e) = validate_elaboration(reason) {
-            println!("[X] Reason: {}", e);
-            return;
-        }
-
-        // Trust check
-        if !self.governance.can_propose(&self.identity.did) {
-            println!("[X] Insufficient trust to propose prune");
-            return;
-        }
-
-        let target = match self.governance.find_entry_cid(target_prefix) {
-            Some(cid) => cid,
-            None => {
-                println!("[X] Entry not found matching '{}'", target_prefix);
-                return;
-            }
-        };
-
-        let entry = self.governance.create_entry(EntryType::Prune {
-            target,
-            reason: reason.to_string(),
-        });
-
-        let peer_count = self.peers.read().unwrap().len();
-        match self.governance.add_entry(entry.clone(), peer_count) {
-            Ok(cid) => {
-                println!("[PRUNE] Proposed removal of {} as {}", target.short(), cid.short());
-                self.broadcast(Message::NewEntry { entry });
-            }
-            Err(e) => {
-                println!("[X] Failed: {}", e);
-            }
-        }
-    }
-
-    pub fn vote(&self, cid_prefix: &str, support: bool, elaboration: &str) {
-        if let Err(e) = validate_elaboration(elaboration) {
-            println!("[X] {}", e);
-            return;
-        }
-
-        let target = match self.governance.find_proposal_cid(cid_prefix) {
-            Some(cid) => cid,
-            None => {
-                println!("[X] Proposal not found matching '{}'", cid_prefix);
-                return;
-            }
-        };
-
-        let vote_data = bincode::serialize(&(&target, support, elaboration)).unwrap();
-        let signature = self.identity.sign(&vote_data);
-
-        match self.governance.vote(
-            &self.identity.did,
-            target,
-            support,
-            elaboration.to_string(),
-            &signature,
-        ) {
-            Ok(executed) => {
-                self.broadcast(Message::Vote {
-                    voter: self.identity.did.clone(),
-                    target,
-                    support,
-                    elaboration: elaboration.to_string(),
-                    signature,
-                });
-
-                println!(
-                    "[VOTE] {} on {}{}",
-                    if support { "YES" } else { "NO" },
-                    target.short(),
-                    if executed { " → EXECUTED" } else { "" }
-                );
-            }
-            Err(e) => println!("[X] Vote failed: {}", e),
-        }
-    }
-
-    pub fn status(&self) {
-        println!("\n=== NODE STATUS ===");
-        println!("DID: {}", self.identity.did.0);
-        println!("Pool: {}", hex::encode(&self.identity.pool_commitment[..8]));
-        println!("Trust: {:.2} (can propose: {})", 
-            self.governance.get_trust(&self.identity.did),
-            self.governance.can_propose(&self.identity.did)
-        );
-        println!("Entries: {} (verified)", self.governance.entry_count());
-        println!("Proposals: {}", self.governance.proposal_count());
-        println!("Known pubkeys: {}", self.governance.known_pubkeys.read().unwrap().len());
-        println!("Pruned CIDs: {}", self.governance.pruned_cids.read().unwrap().len());
-
-        let peers = self.peers.read().unwrap();
-        println!("Peers: {}", peers.len());
-        for (did, peer) in peers.iter() {
-            println!(
-                "  - {} (trust: {:.2}, seen {:?} ago)",
-                did.short(),
-                self.governance.get_trust(did),
-                peer.last_seen.lock().unwrap().elapsed()
-            );
-        }
-
-        let proposals = self.governance.proposals.read().unwrap();
-        if !proposals.is_empty() {
-            println!("Active proposals:");
-            for (cid, prop) in proposals.iter() {
-                let type_str = match &prop.entry_type {
-                    EntryType::Proposal { .. } => "PROPOSAL",
-                    EntryType::Prune { .. } => "PRUNE",
-                    EntryType::Knowledge { .. } => "KNOWLEDGE",
-                };
-                println!(
-                    "  {} [{}] - {}/{} votes {}",
-                    cid.short(),
-                    type_str,
-                    prop.votes_for.len(),
-                    prop.threshold,
-                    if prop.executed { "(EXECUTED)" } else { "" }
-                );
-            }
-        }
-    }
-
-    pub fn peer_count(&self) -> usize {
-        self.peers.read().unwrap().len()
-    }
-
-    pub fn shutdown(&self) {
-        println!("[SHUTDOWN] Initiating...");
-        self.running.store(false, Ordering::Relaxed);
-        self.listener.write().unwrap().take();
-        thread::sleep(Duration::from_millis(500));
-        if let Err(e) = self.governance.save() {
-            eprintln!("[SHUTDOWN] Save error: {}", e);
-        }
-        self.peers.write().unwrap().clear();
-        println!("[SHUTDOWN] Complete");
-    }
-}
-
-// ============================================================================
-// MAIN
-// ============================================================================
-
-fn main() -> io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-
-    let addr = args.get(1).map(|s| s.as_str()).unwrap_or("127.0.0.1:9090");
-    let pool = args.get(2).map(|s| s.as_str()).unwrap_or("default_pool");
-
-    let node = Node::new(addr, pool)?;
-    let running = Arc::clone(&node.running);
-
-    #[cfg(unix)]
-    {
-        let running_clone = Arc::clone(&running);
-        thread::spawn(move || {
-            unsafe {
-                libc::signal(libc::SIGTERM, handle_signal as libc::sighandler_t);
-                libc::signal(libc::SIGINT, handle_signal as libc::sighandler_t);
-            }
-            while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(100));
-            }
-            running_clone.store(false, Ordering::Relaxed);
-        });
-    }
-
-    #[cfg(windows)]
-    {
-        let running_clone = Arc::clone(&running);
-        thread::spawn(move || {
-            unsafe {
-                unsafe extern "system" {
-                    fn SetConsoleCtrlHandler(
-                        handler: Option<unsafe extern "system" fn(u32) -> i32>,
-                        add: i32,
-                    ) -> i32;
-                }
-                SetConsoleCtrlHandler(Some(windows_handler), 1);
-            }
-            while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(100));
-            }
-            running_clone.store(false, Ordering::Relaxed);
-        });
-    }
-
-    for peer_addr in args.iter().skip(3) {
-        match node.connect(peer_addr) {
-            Ok(_) => println!("[OK] Connected to {}", peer_addr),
-            Err(e) => eprintln!("[X] Failed to connect to {}: {}", peer_addr, e),
-        }
-    }
-
-    println!("\nCommands:");
-    println!("  propose <text...>     - Create votable proposal (requires trust >= {:.1})", MIN_TRUST_FOR_PROPOSALS);
-    println!("  prune <cid> <reason>  - Propose democratic removal");
-    println!("  knowledge <cat> <concept> <content> <elaboration>");
-    println!("  vote <cid> <yes|no> <elaboration>");
-    println!("  connect <addr>");
-    println!("  status");
-    println!("  quit\n");
-
-    let (tx, rx) = mpsc::channel::<String>();
-    let stdin_running = Arc::clone(&running);
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut handle = stdin.lock();
-        let mut line = String::new();
-        while stdin_running.load(Ordering::Relaxed) {
-            line.clear();
-            match handle.read_line(&mut line) {
-                Ok(0) => {
-                    drop(handle);
-                    while stdin_running.load(Ordering::Relaxed) {
-                        thread::sleep(Duration::from_secs(1));
-                    }
-                    break;
-                }
-                Ok(_) => {
-                    if tx.send(line.clone()).is_err() {
-                        break;
-                    }
-                }
+    
+    fn reader_loop(node_weak: Weak<Node>, conn: Arc<TcpConnection>, addr: SocketAddr) {
+        let mut stream = match conn.stream.lock().unwrap().try_clone() { Ok(s) => s, Err(_) => return };
+        let mut framer = MessageFramer::new();
+        loop {
+            let node = match node_weak.upgrade() { Some(n) => n, None => break };
+            if !conn.is_alive() { break; }
+            match framer.read_message(&mut stream) {
+                Ok(Some(data)) => { *conn.last_activity.write().unwrap() = Instant::now(); if let Ok(msg) = NetMessage::deserialize(&data) { let _ = node.handle_message(msg, addr, &conn); } }
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
                 Err(_) => break,
             }
         }
-    });
-
-    while running.load(Ordering::Relaxed) {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(input) => {
-                let parts: Vec<&str> = input.trim().split_whitespace().collect();
-                if parts.is_empty() {
-                    continue;
-                }
-
-                match parts[0] {
-                    "propose" if parts.len() >= 2 => {
-                        let text = parts[1..].join(" ");
-                        node.propose(&text, &text);
-                    }
-                    "prune" if parts.len() >= 3 => {
-                        let reason = parts[2..].join(" ");
-                        node.propose_prune(parts[1], &reason);
-                    }
-                    "knowledge" if parts.len() >= 5 => {
-                        let elaboration = parts[4..].join(" ");
-                        node.propose_knowledge(parts[1], parts[2], parts[3], &elaboration);
-                    }
-                    "vote" if parts.len() >= 4 => {
-                        let support = parts[2] == "yes" || parts[2] == "y" || parts[2] == "true";
-                        let elaboration = parts[3..].join(" ");
-                        node.vote(parts[1], support, &elaboration);
-                    }
-                    "connect" if parts.len() >= 2 => {
-                        match node.connect(parts[1]) {
-                            Ok(_) => println!("[OK] Connected"),
-                            Err(e) => println!("[X] {}", e),
-                        }
-                    }
-                    "status" => node.status(),
-                    "quit" | "exit" => break,
-                    _ => println!("Unknown command. Try: propose, prune, knowledge, vote, connect, status, quit"),
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        if let Some(node) = node_weak.upgrade() { node.connection_pool.remove(addr); }
+    }
+    
+    fn handle_message(&self, msg: NetMessage, from: SocketAddr, conn: &Arc<TcpConnection>) -> Result<()> {
+        match msg {
+            NetMessage::Hello { did, pubkey, pool, expr_root } => self.handle_hello(did, pubkey, pool, expr_root, from, conn),
+            NetMessage::Challenge(nonce) => { let sig = self.sign(&nonce); conn.send(&NetMessage::Response { nonce, signature: sig }.serialize()?)?; Ok(()) }
+            NetMessage::Response { nonce, signature } => self.handle_response(nonce, signature, from, conn),
+            NetMessage::ElaborateRequest => { *conn.state.write().unwrap() = ConnectionState::AwaitingElaboration; println!("🔔 {} requests elaboration", from); println!("   Use 'elaborate <text>' to respond"); Ok(()) }
+            NetMessage::Elaborate { text, signature } => self.handle_elaborate(text, signature, from, conn),
+            NetMessage::Approve { .. } => { *conn.state.write().unwrap() = ConnectionState::Connected; println!("✓ Authenticated with {}", from); let store = self.store.read().unwrap(); let msg = NetMessage::SyncRequest { merkle: store.merkle_root(), have: store.log().to_vec() }; conn.send(&msg.serialize()?)?; Ok(()) }
+            NetMessage::Reject { reason, .. } => { println!("✗ Rejected by {}: {}", from, reason); self.connection_pool.remove(from); Ok(()) }
+            NetMessage::Expression(data) => self.handle_expression(data, from, conn),
+            NetMessage::Signal(signal) => self.handle_signal(signal, from, conn),
+            NetMessage::SyncRequest { merkle, have } => self.handle_sync_request(merkle, have, from, conn),
+            NetMessage::SyncReply { expressions } => self.handle_sync_reply(expressions, from, conn),
+            NetMessage::Heartbeat { .. } => { *conn.last_activity.write().unwrap() = Instant::now(); Ok(()) }
+            NetMessage::Disconnect { .. } => { self.connection_pool.remove(from); println!("🔌 {} disconnected", from); Ok(()) }
         }
     }
+    
+    fn handle_hello(&self, did: Did, pubkey: Vec<u8>, pool: [u8; 32], _expr_root: [u8; 32], from: SocketAddr, conn: &Arc<TcpConnection>) -> Result<()> {
+        // Verify pool
+        let our_pool = self.pool.read().unwrap();
+        if let Some(p) = *our_pool { if pool != p { conn.send(&NetMessage::Reject { reason: "Pool mismatch".into(), signature: self.sign(b"pool_mismatch") }.serialize()?)?; return Err(DiagonError::Validation("Pool mismatch".into())); } }
+        else { conn.send(&NetMessage::Reject { reason: "No pool configured".into(), signature: self.sign(b"no_pool") }.serialize()?)?; return Err(DiagonError::Validation("No pool".into())); }
+        
+        // Store peer info
+        *conn.did.write().unwrap() = Some(did.clone());
+        *conn.pubkey.write().unwrap() = Some(pubkey);
+        self.connection_pool.register_did(from, &did);
+        
+        if conn.initiated {
+            // WE initiated this connection - this is their Hello response
+            // Just wait for their Challenge, then we'll elaborate
+            println!("← Hello from {} ({})", from, did.short());
+            // Send our challenge to verify them too
+            let mut nonce = [0u8; 32]; OsRng.fill_bytes(&mut nonce);
+            *conn.challenge_sent.write().unwrap() = Some(nonce);
+            *conn.challenge_time.write().unwrap() = Some(Instant::now());
+            conn.send(&NetMessage::Challenge(nonce).serialize()?)?;
+        } else {
+            // THEY connected to us - send Hello back + Challenge + ElaborateRequest
+            let store = self.store.read().unwrap();
+            conn.send(&NetMessage::Hello { did: self.did.clone(), pubkey: self.public_key.as_bytes().to_vec(), pool: self.pool.read().unwrap().unwrap(), expr_root: store.merkle_root() }.serialize()?)?;
+            
+            // Generate and send challenge
+            let mut nonce = [0u8; 32]; OsRng.fill_bytes(&mut nonce);
+            *conn.challenge_sent.write().unwrap() = Some(nonce);
+            *conn.challenge_time.write().unwrap() = Some(Instant::now());
+            conn.send(&NetMessage::Challenge(nonce).serialize()?)?;
+            
+            // Request elaboration from initiator
+            conn.send(&NetMessage::ElaborateRequest.serialize()?)?;
+            
+            println!("← Connection from {} ({})", from, did.short());
+            println!("  Awaiting elaboration...");
+            *conn.state.write().unwrap() = ConnectionState::AwaitingElaboration;
+        }
+        
+        Ok(())
+    }
+    
+    fn handle_response(&self, nonce: [u8; 32], signature: Vec<u8>, _from: SocketAddr, conn: &Arc<TcpConnection>) -> Result<()> {
+        if conn.challenge_sent.read().unwrap().as_ref() != Some(&nonce) { return Err(DiagonError::Validation("Nonce mismatch".into())); }
+        if let Some(time) = *conn.challenge_time.read().unwrap() { if time.elapsed() > Duration::from_secs(CHALLENGE_TIMEOUT_SECS) { return Err(DiagonError::Validation("Challenge expired".into())); } }
+        if let Some(pk) = conn.pubkey.read().unwrap().as_ref() { self.verify(&nonce, &signature, pk)?; } else { return Err(DiagonError::Validation("No pubkey".into())); }
+        *conn.challenge_sent.write().unwrap() = None;
+        Ok(())
+    }
+    
+    fn handle_elaborate(&self, text: String, signature: Vec<u8>, from: SocketAddr, conn: &Arc<TcpConnection>) -> Result<()> {
+        if text.len() < MIN_ELABORATION_LEN { return Err(DiagonError::Validation("Elaboration too short".into())); }
+        if let Some(pk) = conn.pubkey.read().unwrap().as_ref() { self.verify(text.as_bytes(), &signature, pk)?; } else { return Err(DiagonError::Validation("No pubkey".into())); }
+        *conn.elaboration.write().unwrap() = Some(text.clone());
+        *conn.state.write().unwrap() = ConnectionState::PendingApproval;
+        if let Some(did) = conn.did.read().unwrap().as_ref() {
+            println!();
+            println!("🔔 ELABORATION from {}", did.short());
+            println!("   \"{}\"", text);
+            println!("   Use 'approve {}' or 'reject {} <reason>'", did.short(), did.short());
+        }
+        Ok(())
+    }
+    
+    fn handle_expression(&self, data: Vec<u8>, from: SocketAddr, conn: &Arc<TcpConnection>) -> Result<()> {
+        let mut store = self.store.write().unwrap();
+        if let Some((cid, is_new)) = store.deserialize_and_store(&data) {
+            if is_new {
+                println!("[EXPR] Received {}", cid);
+                conn.mark_seen(&cid);
+                drop(store);
+                self.process_expression(cid, &data);
+                let msg = NetMessage::Expression(data);
+                let msg_data = msg.serialize()?;
+                let conns = self.connection_pool.connections.read().unwrap();
+                for (addr, peer_conn) in conns.iter() {
+                    if *addr != from && peer_conn.is_authenticated() && !peer_conn.has_seen(&cid) {
+                        peer_conn.mark_seen(&cid);
+                        peer_conn.send(&msg_data).ok();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    fn process_expression(&self, cid: Cid, data: &[u8]) {
+        let store = self.store.read().unwrap();
+        let expr = match store.fetch(&cid) { Some(e) => e, None => return };
+        let op = store.arena().car(expr);
+        if let SexpNode::Atom(s) = store.arena().get(op) {
+            if s == "signed" {
+                let inner = store.arena().nth(expr, 3);
+                let inner_op = store.arena().car(inner);
+                if let SexpNode::Atom(inner_s) = store.arena().get(inner_op) {
+                    if inner_s == "propose" && !self.state.read().unwrap().proposals.contains_key(&cid) {
+                        let text_ref = store.arena().nth(inner, 1);
+                        if let SexpNode::Atom(text) = store.arena().get(text_ref) {
+                            let peer_count = self.connection_pool.authenticated_addrs().len();
+                            let threshold = self.state.read().unwrap().threshold(peer_count);
+                            let proposal = ProposalState { cid, expr_data: data.to_vec(), proposer: self.did.clone(), elaboration: text.clone(), quorum: QuorumState::new(cid, threshold), executed: false, created: timestamp() };
+                            self.state.write().unwrap().proposals.insert(cid, proposal);
+                            let _ = self.save_state();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    fn handle_signal(&self, signal: QuorumSignal, from: SocketAddr, conn: &Arc<TcpConnection>) -> Result<()> {
+        let mut state = self.state.write().unwrap();
+        if let Some(proposal) = state.proposals.get_mut(&signal.target) {
+            if proposal.quorum.sense(signal.clone()) {
+                println!("[SIGNAL] {} on {} (+{})", if signal.support { "FOR" } else { "AGAINST" }, signal.target.short(), signal.weight);
+                if proposal.quorum.reached() && !proposal.executed { proposal.executed = true; println!("[QUORUM] {} reached!", signal.target); }
+            }
+        }
+        drop(state);
+        let msg = NetMessage::Signal(signal);
+        let msg_data = msg.serialize()?;
+        let conns = self.connection_pool.connections.read().unwrap();
+        for (addr, peer_conn) in conns.iter() { if *addr != from && peer_conn.is_authenticated() { peer_conn.send(&msg_data).ok(); } }
+        Ok(())
+    }
+    
+    fn handle_sync_request(&self, peer_merkle: [u8; 32], have: Vec<Cid>, from: SocketAddr, conn: &Arc<TcpConnection>) -> Result<()> {
+        let store = self.store.read().unwrap();
+        if store.merkle_root() != peer_merkle {
+            let have_set: HashSet<_> = have.into_iter().collect();
+            let missing: Vec<Vec<u8>> = store.log().iter().filter(|cid| !have_set.contains(cid)).filter_map(|cid| store.serialize_expr(cid)).collect();
+            if !missing.is_empty() { conn.send(&NetMessage::SyncReply { expressions: missing }.serialize()?)?; }
+        }
+        Ok(())
+    }
+    
+    fn handle_sync_reply(&self, expressions: Vec<Vec<u8>>, _from: SocketAddr, _conn: &Arc<TcpConnection>) -> Result<()> {
+        let mut store = self.store.write().unwrap();
+        let mut added = 0;
+        for data in expressions {
+            if let Some((cid, true)) = store.deserialize_and_store(&data) { added += 1; drop(store); self.process_expression(cid, &data); store = self.store.write().unwrap(); }
+        }
+        if added > 0 { println!("[SYNC] Received {} expressions", added); drop(store); let _ = self.save_state(); }
+        Ok(())
+    }
+    
+    fn broadcast_authenticated(&self, msg: &NetMessage) {
+        if let Ok(data) = msg.serialize() { for addr in self.connection_pool.authenticated_addrs() { if let Some(conn) = self.connection_pool.get(&addr) { conn.send(&data).ok(); } } }
+    }
+    
+    fn heartbeat_loop(node: Arc<Node>) {
+        while node.running.load(Ordering::Relaxed) {
+            thread::sleep(HEARTBEAT_INTERVAL);
+            node.broadcast_authenticated(&NetMessage::Heartbeat { signature: node.sign(b"heartbeat") });
+            let conns = node.connection_pool.connections.read().unwrap();
+            let dead: Vec<_> = conns.iter().filter(|(_, c)| !c.is_alive()).map(|(a, _)| *a).collect();
+            drop(conns);
+            for addr in dead { node.connection_pool.remove(addr); node.reconnect_queue.write().unwrap().push_back((addr, Instant::now(), 0)); }
+        }
+    }
+    
+    fn sync_loop(node: Arc<Node>) {
+        while node.running.load(Ordering::Relaxed) {
+            thread::sleep(SYNC_INTERVAL);
+            let store = node.store.read().unwrap();
+            let msg = NetMessage::SyncRequest { merkle: store.merkle_root(), have: store.log().to_vec() };
+            drop(store);
+            for addr in node.connection_pool.authenticated_addrs().into_iter().take(3) {
+                if let Some(conn) = node.connection_pool.get(&addr) { if let Ok(data) = msg.serialize() { conn.send(&data).ok(); } }
+            }
+        }
+    }
+    
+    fn reconnect_loop(node: Arc<Node>) {
+        while node.running.load(Ordering::Relaxed) {
+            thread::sleep(CONNECTION_RETRY_INTERVAL);
+            let mut queue = node.reconnect_queue.write().unwrap();
+            let len = queue.len();
+            for _ in 0..len.min(5) {
+                if let Some((addr, last, attempts)) = queue.pop_front() {
+                    if last.elapsed() < CONNECTION_RETRY_INTERVAL { queue.push_back((addr, last, attempts)); continue; }
+                    if attempts >= MAX_RECONNECT_ATTEMPTS { continue; }
+                    drop(queue);
+                    if node.connect(&addr.to_string()).is_err() { node.reconnect_queue.write().unwrap().push_back((addr, Instant::now(), attempts + 1)); }
+                    queue = node.reconnect_queue.write().unwrap();
+                }
+            }
+        }
+    }
+    
+    pub fn shutdown(&self) {
+        println!("\n🛑 Shutting down...");
+        self.running.store(false, Ordering::Relaxed);
+        self.broadcast_authenticated(&NetMessage::Disconnect { signature: self.sign(b"disconnect") });
+        thread::sleep(Duration::from_millis(100));
+        let _ = self.save_state();
+        self.connection_pool.shutdown();
+        self.listener.write().unwrap().take();
+        println!("✓ Shutdown complete");
+    }
+}
 
+fn sha256(data: &[u8]) -> [u8; 32] { Sha256::digest(data).into() }
+fn timestamp() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() }
+fn score_elaboration(text: &str) -> f64 {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() { return 0.0; }
+    let unique: HashSet<&str> = words.iter().copied().collect();
+    ((unique.len() as f64 / words.len() as f64) * 0.5 + (words.len() as f64 / 100.0).min(1.0) * 0.5).clamp(0.0, 1.0)
+}
+
+mod hex {
+    pub fn encode(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{:02x}", b)).collect() }
+    pub fn decode(s: &str) -> std::result::Result<Vec<u8>, ()> {
+        if s.len() % 2 != 0 { return Err(()); }
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).map_err(|_| ())).collect()
+    }
+}
+
+fn print_help() {
+    println!("Commands:");
+    println!("  auth <passphrase>              Set pool passphrase");
+    println!("  connect <addr>                 Connect to peer");
+    println!("  elaborate <text>               Send elaboration");
+    println!("  approve <id>                   Approve pending peer");
+    println!("  reject <id> <reason>           Reject pending peer");
+    println!("  propose <text>                 Create proposal");
+    println!("  vote <cid> <y/n> <elaboration> Vote on proposal");
+    println!("  propose-pool <phrase> - <rationale>");
+    println!("  vote-pool <id> <y/n> <elaboration>");
+    println!("  list-pools                     Show pools");
+    println!("  status                         Show status");
+    println!("  eval <sexp>                    Evaluate S-expression");
+    println!("  help                           Show this help");
+    println!("  quit                           Exit");
+    println!();
+}
+
+fn main() -> io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let addr = args.get(1).map(|s| s.as_str()).unwrap_or("127.0.0.1:9070");
+    let db_path = args.get(2).map(|s| s.as_str()).unwrap_or("diagon_db");
+    let node = match Node::new(addr, db_path) { Ok(n) => n, Err(e) => { eprintln!("Failed to start: {}", e); return Ok(()); } };
+    print_help();
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    while node.running.load(Ordering::Relaxed) {
+        print!("> "); stdout.flush()?;
+        let mut input = String::new();
+        match stdin.read_line(&mut input) { Ok(0) => break, Ok(_) => {}, Err(_) => break }
+        let input = input.trim();
+        if input.is_empty() { continue; }
+        let parts: Vec<&str> = input.splitn(2, ' ').collect();
+        let cmd = parts[0];
+        let arg = parts.get(1).unwrap_or(&"");
+        match cmd {
+            "auth" if !arg.is_empty() => { node.auth(arg); }
+            "connect" if !arg.is_empty() => { if let Err(e) = node.connect(arg) { println!("✗ {}", e); } }
+            "elaborate" if !arg.is_empty() => { node.elaborate(arg); }
+            "approve" if !arg.is_empty() => { node.approve(arg); }
+            "reject" if !arg.is_empty() => { let parts: Vec<&str> = arg.splitn(2, ' ').collect(); node.reject(parts[0], parts.get(1).unwrap_or(&"Rejected")); }
+            "propose" if !arg.is_empty() => { node.propose(arg); }
+            "vote" if !arg.is_empty() => { let parts: Vec<&str> = arg.splitn(3, ' ').collect(); if parts.len() >= 3 { node.vote(parts[0], matches!(parts[1], "y" | "yes" | "true"), parts[2]); } else { println!("Usage: vote <cid> <y/n> <elaboration>"); } }
+            "propose-pool" if !arg.is_empty() => { if let Some(pos) = arg.find(" - ") { node.propose_pool(arg[..pos].trim(), arg[pos + 3..].trim()); } else { println!("Usage: propose-pool <phrase> - <rationale>"); } }
+            "vote-pool" if !arg.is_empty() => { let parts: Vec<&str> = arg.splitn(3, ' ').collect(); if parts.len() >= 3 { node.vote_pool(parts[0], matches!(parts[1], "y" | "yes" | "true"), parts[2]); } else { println!("Usage: vote-pool <id> <y/n> <elaboration>"); } }
+            "list-pools" => { node.list_pools(); }
+            "status" => { node.status(); }
+            "eval" if !arg.is_empty() => { node.eval(arg); }
+            "help" => { print_help(); }
+            "quit" | "exit" => { break; }
+            _ => { println!("Unknown command. Type 'help' for commands."); }
+        }
+    }
     node.shutdown();
     Ok(())
 }
 
-static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-#[cfg(unix)]
-extern "C" fn handle_signal(_: libc::c_int) {
-    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn windows_handler(_: u32) -> i32 {
-    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
-    1
-}
-
 // ============================================================================
-// TESTS
+// TESTS - Run with: cargo test -- --nocapture --test-threads=1
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
-
-    fn unique_db_path() -> String {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        format!("test_db_{}_{}", pid, id)
+    
+    const TEST_PASSPHRASE: &str = "quantum leap beyond horizon";
+    
+    fn setup_test_dir(name: &str) -> String {
+        let dir = format!("/tmp/diagon_test_{}", name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
-
-    fn unique_port() -> u16 {
-        static PORT: AtomicU64 = AtomicU64::new(19000);
-        PORT.fetch_add(1, Ordering::Relaxed) as u16
+    
+    fn cleanup_test_dir(dir: &str) {
+        let _ = std::fs::remove_dir_all(dir);
     }
-
-    fn cleanup_db(path: &str) {
-        std::fs::remove_dir_all(path).ok();
-    }
-
+    
     #[test]
-    fn test_trust_scoring() {
-        // Low quality - short, repetitive
-        let low = score_elaboration("yes yes yes yes");
-        assert!(low < 0.4, "Repetitive text should score low: {}", low);
-
-        // High quality - diverse vocabulary, substantive
-        let high = score_elaboration(
-            "This proposal demonstrates thoughtful consideration of the democratic process \
-             and provides meaningful contribution to our collective governance. \
-             We should carefully evaluate the implications of this change and ensure \
-             that it aligns with our shared values of transparency, accountability, \
-             and inclusive participation in network decisions."
-        );
-        assert!(high > 0.5, "Quality text should score high: {}", high);
-
-        // Empty
-        let empty = score_elaboration("");
-        assert_eq!(empty, 0.0, "Empty should score 0");
-
-        println!("✓ Trust scoring test passed");
-    }
-
-    #[test]
-    fn test_trust_gated_proposals() {
-        let db = unique_db_path();
-        std::fs::create_dir_all(&db).ok();
-
-        let identity = Arc::new(NodeIdentity::new("test_pool"));
-        let governance = GovernanceActor::new(Arc::clone(&identity), &format!("{}/gov.cbor", db));
-        governance.register_pubkey(identity.did.clone(), identity.public_key.clone());
-
-        // Initial trust should allow proposals (0.5 >= 0.4)
-        assert!(governance.can_propose(&identity.did), "Initial trust should allow proposals");
-
-        // Simulate extremely low-quality participation to drop trust
-        // Using single character repeated to ensure minimum score
-        for _ in 0..50 {
-            governance.update_trust(&identity.did, "a a a a a a a a a a a a a a a a a a a a");
-        }
-
-        let trust = governance.get_trust(&identity.did);
-        println!("Trust after low-quality participation: {:.3}", trust);
+    fn test_node_creation() {
+        println!("\n═══ TEST: Node Creation ═══");
+        let dir = setup_test_dir("creation");
         
-        // With 70% weight on history and 30% on new score, after many iterations
-        // of ~0.25 score inputs, trust converges toward that value
-        // Check that trust moved in the expected direction
-        assert!(trust < 0.5, "Trust should drop with very low-quality elaborations: {:.3}", trust);
-
-        cleanup_db(&db);
-        println!("✓ Trust gated proposals test passed");
-    }
-
-    #[test]
-    fn test_prune_lifecycle() {
-        let db = unique_db_path();
-        std::fs::create_dir_all(&db).ok();
-
-        let identity = Arc::new(NodeIdentity::new("test_pool"));
-        let governance = GovernanceActor::new(Arc::clone(&identity), &format!("{}/gov.cbor", db));
-        governance.register_pubkey(identity.did.clone(), identity.public_key.clone());
-
-        // Create knowledge entry
-        let knowledge = governance.create_entry(EntryType::Knowledge {
-            category: "Test".into(),
-            concept: "ToBeRemoved".into(),
-            content: "This content will be pruned".into(),
-        });
-        let knowledge_cid = governance.add_entry(knowledge, 0).unwrap();
-
-        // Create prune proposal
-        let prune = governance.create_entry(EntryType::Prune {
-            target: knowledge_cid,
-            reason: "This content violates community guidelines and must be removed".into(),
-        });
-        let prune_cid = governance.add_entry(prune, 0).unwrap();
-
-        // Vote to execute
-        let elab = "Supporting this prune because the content is inappropriate";
-        let vote_data = bincode::serialize(&(&prune_cid, true, elab)).unwrap();
-        let sig = identity.sign(&vote_data);
-        
-        let executed = governance.vote(&identity.did, prune_cid, true, elab.into(), &sig).unwrap();
-        assert!(executed, "Single vote should execute with 0 peers");
-
-        // Entry should be removed
-        assert!(!governance.entries.read().unwrap().contains_key(&knowledge_cid), 
-            "Pruned entry should be removed");
-
-        // CID should be marked as pruned
-        assert!(governance.pruned_cids.read().unwrap().contains(&knowledge_cid),
-            "CID should be in pruned set");
-
-        // Attempt to re-add should fail
-        let retry = governance.create_entry(EntryType::Knowledge {
-            category: "Test".into(),
-            concept: "ToBeRemoved".into(),
-            content: "Trying to sneak this back in".into(),
-        });
-        // Manually set the CID to match (in real usage, different timestamp would create different CID)
-        let mut retry_fixed = retry;
-        retry_fixed.cid = knowledge_cid;
-        retry_fixed.data = governance.entries.read().unwrap().values().next().unwrap().data.clone();
-        
-        // The actual re-add would fail on CID check, but let's verify pruned_cids check
-        assert!(governance.pruned_cids.read().unwrap().contains(&knowledge_cid));
-
-        cleanup_db(&db);
-        println!("✓ Prune lifecycle test passed");
-    }
-
-    #[test]
-    fn test_entry_type_tracking() {
-        let db = unique_db_path();
-        std::fs::create_dir_all(&db).ok();
-
-        let identity = Arc::new(NodeIdentity::new("test_pool"));
-        let governance = GovernanceActor::new(Arc::clone(&identity), &format!("{}/gov.cbor", db));
-        governance.register_pubkey(identity.did.clone(), identity.public_key.clone());
-
-        // Create proposal
-        let entry = governance.create_entry(EntryType::Proposal {
-            text: "Test proposal for entry type tracking verification".into(),
-        });
-        let cid = governance.add_entry(entry, 0).unwrap();
-
-        // Verify entry_type is tracked in proposal
-        let proposals = governance.proposals.read().unwrap();
-        let proposal = proposals.get(&cid).unwrap();
-        
-        match &proposal.entry_type {
-            EntryType::Proposal { text } => {
-                assert!(text.contains("entry type tracking"));
-            }
-            _ => panic!("Wrong entry type"),
-        }
-
-        cleanup_db(&db);
-        println!("✓ Entry type tracking test passed");
-    }
-
-    #[test]
-    fn test_persistence_with_validation() {
-        let db = unique_db_path();
-        std::fs::create_dir_all(&db).ok();
-
-        let identity = Arc::new(NodeIdentity::new("test_pool"));
-        let gov1 = GovernanceActor::new(Arc::clone(&identity), &format!("{}/gov.cbor", db));
-        gov1.register_pubkey(identity.did.clone(), identity.public_key.clone());
-
-        // Create entries
-        let k1 = gov1.create_entry(EntryType::Knowledge {
-            category: "Persistence".into(),
-            concept: "Test".into(),
-            content: "Should survive restart".into(),
-        });
-        gov1.add_entry(k1, 0).unwrap();
-
-        // Update trust
-        gov1.update_trust(&identity.did, 
-            "High quality elaboration with diverse vocabulary demonstrating thoughtful participation");
-
-        let trust_before = gov1.get_trust(&identity.did);
-        let entries_before = gov1.entry_count();
-
-        // Save
-        gov1.save().unwrap();
-
-        // Create new governance actor (simulates restart)
-        let gov2 = GovernanceActor::new(Arc::clone(&identity), &format!("{}/gov.cbor", db));
-        gov2.register_pubkey(identity.did.clone(), identity.public_key.clone());
-
-        // Verify restoration
-        assert_eq!(gov2.entry_count(), entries_before, "Entries should persist");
-        
-        let trust_after = gov2.get_trust(&identity.did);
-        assert!((trust_after - trust_before).abs() < 0.001, 
-            "Trust should persist: {} vs {}", trust_before, trust_after);
-
-        cleanup_db(&db);
-        println!("✓ Persistence with validation test passed");
-    }
-
-    #[test]
-    fn test_invalid_entry_rejected_on_load() {
-        let db = unique_db_path();
-        std::fs::create_dir_all(&db).ok();
-
-        let identity = Arc::new(NodeIdentity::new("test_pool"));
-        let gov = GovernanceActor::new(Arc::clone(&identity), &format!("{}/gov.cbor", db));
-        gov.register_pubkey(identity.did.clone(), identity.public_key.clone());
-
-        // Create two valid entries
-        let entry1 = gov.create_entry(EntryType::Knowledge {
-            category: "Valid".into(),
-            concept: "Entry1".into(),
-            content: "This is valid".into(),
-        });
-        let cid1 = gov.add_entry(entry1.clone(), 0).unwrap();
-
-        let entry2 = gov.create_entry(EntryType::Knowledge {
-            category: "Valid".into(),
-            concept: "Entry2".into(),
-            content: "This is also valid".into(),
-        });
-        gov.add_entry(entry2.clone(), 0).unwrap();
-
-        assert_eq!(gov.entry_count(), 2, "Should have 2 entries before save");
-
-        // Now corrupt one entry's signature in storage
         {
-            let mut entries = gov.entries.write().unwrap();
-            if let Some(entry) = entries.get_mut(&cid1) {
-                entry.signature = vec![0u8; entry.signature.len()]; // Invalid signature
+            let node = Node::new("127.0.0.1:19081", &format!("{}/node", dir))
+                .expect("Failed to create node");
+            println!("✓ Node created with DID: {}", node.did.0);
+            assert!(!node.did.0.is_empty());
+            node.shutdown();
+        }
+        
+        cleanup_test_dir(&dir);
+        println!("✓ Node creation test passed\n");
+    }
+    
+    #[test]
+    fn test_pool_authentication() {
+        println!("\n═══ TEST: Pool Authentication ═══");
+        let dir = setup_test_dir("auth");
+        
+        {
+            let node = Node::new("127.0.0.1:19082", &format!("{}/node", dir))
+                .expect("Failed to create node");
+            
+            // Test valid passphrase
+            assert!(node.auth(TEST_PASSPHRASE), "Valid passphrase should authenticate");
+            println!("✓ Valid passphrase accepted");
+            
+            // Test invalid passphrase
+            assert!(!node.auth("wrong passphrase"), "Invalid passphrase should fail");
+            println!("✓ Invalid passphrase rejected");
+            
+            node.shutdown();
+        }
+        
+        cleanup_test_dir(&dir);
+        println!("✓ Pool authentication test passed\n");
+    }
+    
+    #[test]
+    fn test_sexp_arena() {
+        println!("\n═══ TEST: S-Expression Arena ═══");
+        
+        let mut arena = Arena::new();
+        
+        // Test atoms
+        let a = arena.atom("hello");
+        let b = arena.atom("hello"); // Should return same ref
+        assert_eq!(a, b, "Interned atoms should be equal");
+        println!("✓ Atom interning works");
+        
+        // Test cons
+        let c = arena.cons(a, SexpRef::NIL);
+        assert!(!c.is_nil());
+        assert_eq!(arena.car(c), a);
+        assert_eq!(arena.cdr(c), SexpRef::NIL);
+        println!("✓ Cons cells work");
+        
+        // Test list
+        let x = arena.atom("x");
+        let y = arena.atom("y");
+        let z = arena.atom("z");
+        let list = arena.list(&[x, y, z]);
+        assert_eq!(arena.nth(list, 0), x);
+        assert_eq!(arena.nth(list, 1), y);
+        assert_eq!(arena.nth(list, 2), z);
+        println!("✓ List construction works");
+        
+        // Test display
+        let display = arena.display(list);
+        assert_eq!(display, "(x y z)");
+        println!("✓ Display: {}", display);
+        
+        // Test parse
+        let parsed = arena.parse("(propose \"test\" 42)").unwrap();
+        let parsed_display = arena.display(parsed);
+        println!("✓ Parsed: {}", parsed_display);
+        
+        // Test serialization roundtrip
+        let serialized = arena.serialize(list);
+        let deserialized = arena.deserialize(&serialized).unwrap();
+        assert_eq!(arena.display(deserialized), "(x y z)");
+        println!("✓ Serialization roundtrip works");
+        
+        println!("✓ S-Expression arena test passed\n");
+    }
+    
+    #[test]
+    fn test_expression_store() {
+        println!("\n═══ TEST: Expression Store ═══");
+        
+        let mut store = ExprStore::new();
+        
+        // Store an expression
+        let expr = store.arena_mut().parse("(propose \"test proposal\")").unwrap();
+        let (cid1, is_new1) = store.store(expr);
+        assert!(is_new1, "First store should be new");
+        println!("✓ Stored expression: {}", cid1);
+        
+        // Store same expression again
+        let expr2 = store.arena_mut().parse("(propose \"test proposal\")").unwrap();
+        let (cid2, is_new2) = store.store(expr2);
+        assert!(!is_new2, "Duplicate should not be new");
+        assert_eq!(cid1, cid2, "Same content should have same CID");
+        println!("✓ Deduplication works");
+        
+        // Fetch
+        let fetched = store.fetch(&cid1);
+        assert!(fetched.is_some());
+        println!("✓ Fetch works");
+        
+        // Log
+        assert_eq!(store.log().len(), 1);
+        println!("✓ Log has 1 entry");
+        
+        println!("✓ Expression store test passed\n");
+    }
+    
+    #[test]
+    fn test_quorum_sensing() {
+        println!("\n═══ TEST: Quorum Sensing ═══");
+        
+        let target = Cid::new(b"test_proposal");
+        let threshold = 2000;
+        let mut quorum = QuorumState::new(target, threshold);
+        
+        // Add signals
+        let signal1 = QuorumSignal {
+            source: Did("did:test:node1".into()),
+            target,
+            weight: 800,
+            support: true,
+            elaboration: "I support this proposal strongly".into(),
+            timestamp: timestamp(),
+            signature: vec![],
+        };
+        
+        assert!(quorum.sense(signal1.clone()), "First signal should be accepted");
+        println!("✓ Signal 1 accepted: weight={}", signal1.weight);
+        
+        // Duplicate source should be rejected
+        let signal1_dup = QuorumSignal {
+            source: Did("did:test:node1".into()),
+            target,
+            weight: 500,
+            support: true,
+            elaboration: "Duplicate signal".into(),
+            timestamp: timestamp(),
+            signature: vec![],
+        };
+        assert!(!quorum.sense(signal1_dup), "Duplicate source should be rejected");
+        println!("✓ Duplicate source rejected");
+        
+        // Different source should work
+        let signal2 = QuorumSignal {
+            source: Did("did:test:node2".into()),
+            target,
+            weight: 700,
+            support: true,
+            elaboration: "I also support this proposal".into(),
+            timestamp: timestamp(),
+            signature: vec![],
+        };
+        assert!(quorum.sense(signal2.clone()), "Second signal should be accepted");
+        println!("✓ Signal 2 accepted: weight={}", signal2.weight);
+        
+        // Check accumulation
+        let accumulated = quorum.accumulated_for();
+        println!("✓ Accumulated: {}/{}", accumulated, threshold);
+        assert!(accumulated >= 1400, "Should have at least 1400 weight");
+        
+        // Add more to reach threshold
+        let signal3 = QuorumSignal {
+            source: Did("did:test:node3".into()),
+            target,
+            weight: 800,
+            support: true,
+            elaboration: "This brings us to quorum".into(),
+            timestamp: timestamp(),
+            signature: vec![],
+        };
+        quorum.sense(signal3);
+        
+        assert!(quorum.reached(), "Quorum should be reached");
+        println!("✓ Quorum reached: {}/{}", quorum.accumulated_for(), threshold);
+        
+        println!("✓ Quorum sensing test passed\n");
+    }
+    
+    #[test]
+    fn test_three_node_mesh() {
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║           DIAGON v0.9.0 - 3-NODE MESH TEST                   ║");
+        println!("╚══════════════════════════════════════════════════════════════╝\n");
+        
+        let dir = setup_test_dir("mesh");
+        
+        // Phase 1: Create nodes
+        println!("═══ PHASE 1: Node Creation ═══");
+        let node1 = Node::new("127.0.0.1:19091", &format!("{}/node1", dir)).expect("Node 1 failed");
+        println!("✓ Node 1: {}", node1.did.short());
+        
+        let node2 = Node::new("127.0.0.1:19092", &format!("{}/node2", dir)).expect("Node 2 failed");
+        println!("✓ Node 2: {}", node2.did.short());
+        
+        let node3 = Node::new("127.0.0.1:19093", &format!("{}/node3", dir)).expect("Node 3 failed");
+        println!("✓ Node 3: {}", node3.did.short());
+        
+        thread::sleep(Duration::from_millis(300));
+        
+        // Phase 2: Authenticate
+        println!("\n═══ PHASE 2: Pool Authentication ═══");
+        assert!(node1.auth(TEST_PASSPHRASE));
+        assert!(node2.auth(TEST_PASSPHRASE));
+        assert!(node3.auth(TEST_PASSPHRASE));
+        println!("✓ All nodes authenticated");
+        
+        // Phase 3: Connect mesh
+        // Connection topology:
+        //   node1 (initiator) -> node2 (receiver)
+        //   node1 (initiator) -> node3 (receiver)
+        //   node2 (initiator) -> node3 (receiver)
+        println!("\n═══ PHASE 3: Mesh Connection ═══");
+        node1.connect("127.0.0.1:19092").expect("N1->N2 failed");
+        thread::sleep(Duration::from_millis(200));
+        node1.connect("127.0.0.1:19093").expect("N1->N3 failed");
+        thread::sleep(Duration::from_millis(200));
+        node2.connect("127.0.0.1:19093").expect("N2->N3 failed");
+        thread::sleep(Duration::from_millis(500));
+        println!("✓ Connection attempts complete");
+        
+        // Phase 4: Initiators elaborate
+        // node1 initiated connections to node2 and node3 -> must elaborate to them
+        // node2 initiated connection to node3 -> must elaborate to node3
+        println!("\n═══ PHASE 4: HITL Elaboration (Initiators) ═══");
+        
+        // node1 is initiator for 2 connections
+        node1.elaborate("Node 1 joining the biological consensus network for distributed governance testing.");
+        println!("✓ Node 1 elaborated (initiator to node2, node3)");
+        thread::sleep(Duration::from_millis(300));
+        
+        // node2 is initiator for 1 connection (to node3)
+        node2.elaborate("Node 2 participating in quorum sensing for collective decision making tests.");
+        println!("✓ Node 2 elaborated (initiator to node3)");
+        thread::sleep(Duration::from_millis(500));
+        
+        // Phase 5: Receivers approve
+        // node2 received connection from node1 -> approves node1
+        // node3 received connections from node1 and node2 -> approves both
+        println!("\n═══ PHASE 5: Peer Approval (Receivers) ═══");
+        
+        // node2 approves node1
+        {
+            let pending = node2.connection_pool.pending_approval();
+            println!("  Node 2 has {} pending peers", pending.len());
+            for (_, conn) in &pending {
+                if let Some(did) = conn.did.read().unwrap().as_ref() {
+                    node2.approve(&did.short());
+                }
             }
         }
-
-        gov.save().unwrap();
-
-        // Reload - corrupted entry should be rejected, valid one kept
-        let gov2 = GovernanceActor::new(Arc::clone(&identity), &format!("{}/gov.cbor", db));
-        gov2.register_pubkey(identity.did.clone(), identity.public_key.clone());
-
-        // Should only have the uncorrupted entry
-        assert_eq!(gov2.entry_count(), 1, "Only valid entry should be loaded");
-
-        cleanup_db(&db);
-        println!("✓ Invalid entry rejection on load test passed");
-    }
-
-    #[test]
-    fn test_two_node_with_trust() {
-        let db1 = unique_db_path();
-        let db2 = unique_db_path();
-        let port1 = unique_port();
-        let port2 = unique_port();
-
-        let addr1 = format!("127.0.0.1:{}", port1);
-        let addr2 = format!("127.0.0.1:{}", port2);
-
-        let node1 = Node::new_with_paths(&addr1, "test_pool", &db1).unwrap();
-        let node2 = Node::new_with_paths(&addr2, "test_pool", &db2).unwrap();
-
+        thread::sleep(Duration::from_millis(200));
+        
+        // node3 approves node1 and node2
+        {
+            let pending = node3.connection_pool.pending_approval();
+            println!("  Node 3 has {} pending peers", pending.len());
+            for (_, conn) in &pending {
+                if let Some(did) = conn.did.read().unwrap().as_ref() {
+                    node3.approve(&did.short());
+                }
+            }
+        }
         thread::sleep(Duration::from_millis(500));
-
-        node2.connect(&addr1).unwrap();
-        thread::sleep(Duration::from_secs(1));
-
-        // Both should have 1 peer
-        assert_eq!(node1.peer_count(), 1);
-        assert_eq!(node2.peer_count(), 1);
-
-        // Node2's trust should have been updated from connection elaboration
-        let node2_trust_on_node1 = node1.governance.get_trust(&node2.identity.did);
-        println!("Node2's trust on Node1: {:.3}", node2_trust_on_node1);
-
-        node1.shutdown();
-        node2.shutdown();
-
-        cleanup_db(&db1);
-        cleanup_db(&db2);
-        println!("✓ Two node with trust test passed");
-    }
-
-    #[test]
-    fn test_mesh_with_prune() {
-        let db1 = unique_db_path();
-        let db2 = unique_db_path();
-        let db3 = unique_db_path();
-
-        let port1 = unique_port();
-        let port2 = unique_port();
-        let port3 = unique_port();
-
-        let addr1 = format!("127.0.0.1:{}", port1);
-        let addr2 = format!("127.0.0.1:{}", port2);
-        let addr3 = format!("127.0.0.1:{}", port3);
-
-        let node1 = Node::new_with_paths(&addr1, "test_pool", &db1).unwrap();
-        let node2 = Node::new_with_paths(&addr2, "test_pool", &db2).unwrap();
-        let node3 = Node::new_with_paths(&addr3, "test_pool", &db3).unwrap();
-
-        thread::sleep(Duration::from_secs(1));
-
-        // Form mesh
-        node2.connect(&addr1).unwrap();
+        
+        // Phase 6: Verify connections
+        println!("\n═══ PHASE 6: Connection Verification ═══");
+        let n1_auth = node1.connection_pool.authenticated_addrs().len();
+        let n2_auth = node2.connection_pool.authenticated_addrs().len();
+        let n3_auth = node3.connection_pool.authenticated_addrs().len();
+        println!("  Node 1: {} authenticated peers", n1_auth);
+        println!("  Node 2: {} authenticated peers", n2_auth);
+        println!("  Node 3: {} authenticated peers", n3_auth);
+        
+        // Phase 7: Create proposal
+        println!("\n═══ PHASE 7: Proposal Creation ═══");
+        // Boost trust to allow proposing
+        node1.state.write().unwrap().update_mark(&node1.did, 0.9);
+        node1.propose("Implement Verkle tree state commitments for efficient state proofs.");
         thread::sleep(Duration::from_millis(500));
-        node3.connect(&addr1).unwrap();
-        thread::sleep(Duration::from_millis(500));
-        node3.connect(&addr2).unwrap();
-        thread::sleep(Duration::from_secs(1));
-
-        // Create knowledge that will be pruned
-        node1.propose_knowledge(
-            "BadContent",
-            "Violation",
-            "This content should be removed",
-            "Adding questionable content for testing democratic removal"
-        );
-        thread::sleep(Duration::from_secs(2));
-
-        // All nodes should have it
-        assert_eq!(node1.governance.entry_count(), 1);
-        assert_eq!(node2.governance.entry_count(), 1);
-        assert_eq!(node3.governance.entry_count(), 1);
-
-        // Get the CID
-        let target_cid = node1.governance.known_cids()[0];
-
-        // Create prune proposal (directly on governance to avoid trust check in test)
-        let prune_entry = node1.governance.create_entry(EntryType::Prune {
-            target: target_cid,
-            reason: "This content violates our community standards and must be removed democratically".into(),
-        });
-        let peer_count = node1.peers.read().unwrap().len();
-        let prune_cid = node1.governance.add_entry(prune_entry.clone(), peer_count).unwrap();
-        node1.broadcast(Message::NewEntry { entry: prune_entry });
-
-        thread::sleep(Duration::from_secs(2));
-
-        // Vote from all nodes
-        let cid_short = prune_cid.short();
-        node1.vote(&cid_short, true, "Supporting removal of this inappropriate content");
-        thread::sleep(Duration::from_millis(500));
-        node2.vote(&cid_short, true, "I agree this content should be removed from our network");
-        thread::sleep(Duration::from_millis(500));
-        node3.vote(&cid_short, true, "Voting yes for democratic content moderation");
-        thread::sleep(Duration::from_secs(3));
-
-        // Content should be pruned on all nodes
-        // Note: Due to propagation timing, check node1 which executed locally
-        assert!(!node1.governance.entries.read().unwrap().contains_key(&target_cid),
-            "Pruned content should be removed from node1");
-
+        
+        let proposal_cid = {
+            let state = node1.state.read().unwrap();
+            state.proposals.keys().next().copied()
+        };
+        
+        if let Some(cid) = proposal_cid {
+            println!("✓ Proposal: {}", cid);
+            
+            // Phase 8: Vote
+            println!("\n═══ PHASE 8: Voting ═══");
+            let prefix = cid.short();
+            
+            node2.state.write().unwrap().update_mark(&node2.did, 0.8);
+            node2.vote(&prefix, true, "Strong support for Verkle trees - significant efficiency gains.");
+            println!("✓ Node 2 voted YES");
+            thread::sleep(Duration::from_millis(300));
+            
+            node3.state.write().unwrap().update_mark(&node3.did, 0.8);
+            node3.vote(&prefix, true, "Agreed, Verkle trees are essential for scalability improvements.");
+            println!("✓ Node 3 voted YES");
+            thread::sleep(Duration::from_millis(500));
+            
+            // Phase 9: Check final state
+            println!("\n═══ PHASE 9: Final State ═══");
+            {
+                let state = node1.state.read().unwrap();
+                if let Some(prop) = state.proposals.get(&cid) {
+                    let votes_for = prop.quorum.accumulated_for();
+                    let threshold = prop.quorum.threshold;
+                    let status = if prop.executed { "EXECUTED" } else if prop.quorum.reached() { "REACHED" } else { "PENDING" };
+                    println!("  Proposal {}: {}/{} [{}]", cid.short(), votes_for, threshold, status);
+                }
+            }
+            
+            let n1_expr = node1.store.read().unwrap().log().len();
+            let n2_expr = node2.store.read().unwrap().log().len();
+            let n3_expr = node3.store.read().unwrap().log().len();
+            println!("  Expressions: N1={}, N2={}, N3={}", n1_expr, n2_expr, n3_expr);
+        }
+        
+        // Phase 10: Shutdown
+        println!("\n═══ PHASE 10: Shutdown ═══");
         node1.shutdown();
         node2.shutdown();
         node3.shutdown();
-
-        cleanup_db(&db1);
-        cleanup_db(&db2);
-        cleanup_db(&db3);
-
-        println!("✓ Mesh with prune test passed");
-    }
-
-    // Include all original 0.5.0 tests for regression testing
-    #[test]
-    fn test_identity_persistence() {
-        let db = unique_db_path();
-        std::fs::create_dir_all(&db).ok();
-
-        let path = format!("{}/identity.cbor", db);
-
-        let id1 = NodeIdentity::load_or_create(&path, "test").unwrap();
-        let did1 = id1.did.clone();
-
-        let id2 = NodeIdentity::load_or_create(&path, "test").unwrap();
-        let did2 = id2.did.clone();
-
-        assert_eq!(did1, did2, "DID should persist across loads");
-
-        cleanup_db(&db);
-        println!("✓ Identity persistence test passed");
-    }
-
-    #[test]
-    fn test_signature_verification() {
-        let db = unique_db_path();
-        std::fs::create_dir_all(&db).ok();
-
-        let identity = Arc::new(NodeIdentity::new("test_pool"));
-        let governance = GovernanceActor::new(Arc::clone(&identity), &format!("{}/gov.cbor", db));
-        governance.register_pubkey(identity.did.clone(), identity.public_key.clone());
-
-        let entry = governance.create_entry(EntryType::Knowledge {
-            category: "Test".into(),
-            concept: "Concept".into(),
-            content: "Content".into(),
-        });
-
-        assert!(governance.add_entry(entry.clone(), 0).is_ok());
-
-        let mut tampered = entry.clone();
-        tampered.data = b"tampered data".to_vec();
-        tampered.cid = Cid::from_entry_data(&tampered.data, tampered.timestamp, &tampered.creator);
-        assert!(governance.add_entry(tampered, 0).is_err());
-
-        cleanup_db(&db);
-        println!("✓ Signature verification test passed");
-    }
-
-    #[test]
-    fn test_pool_mismatch_rejected() {
-        let db1 = unique_db_path();
-        let db2 = unique_db_path();
-        let port1 = unique_port();
-        let port2 = unique_port();
-
-        let addr1 = format!("127.0.0.1:{}", port1);
-        let addr2 = format!("127.0.0.1:{}", port2);
-
-        let node1 = Node::new_with_paths(&addr1, "pool_one", &db1).unwrap();
-        let node2 = Node::new_with_paths(&addr2, "pool_two", &db2).unwrap();
-
-        thread::sleep(Duration::from_millis(500));
-
-        let result = node2.connect(&addr1);
-        assert!(result.is_err(), "Pool mismatch should be rejected");
-
-        node1.shutdown();
-        node2.shutdown();
-
-        cleanup_db(&db1);
-        cleanup_db(&db2);
-        println!("✓ Pool mismatch rejection test passed");
+        
+        cleanup_test_dir(&dir);
+        
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║                    TEST COMPLETE                             ║");
+        println!("╚══════════════════════════════════════════════════════════════╝\n");
     }
 }

@@ -1,381 +1,276 @@
-# Quorum IO - Node
-
-`QUORUM IO: NODE: DIAGON`
+# DIAGON v0.9.0
 
 **Headless P2P Governance System for Decentralized Knowledge Transmission**
 
-Byzantine fault-tolerant peer-to-peer network enabling democratic governance of shared knowledge through cryptographically-verified consensus. Post-quantum cryptography, trust scoring, elaboration-based decision-making, and democratic content moderation over TCP mesh.
+*"In the struggle between truth and deception, let mathematics be the arbiter."*
 
-## Abstract
+Core principles:
+- Homoiconicity: Code is data, data is code
+- Content-addressing: The expression IS its identity
+- Quorum sensing: Accumulate signals, threshold triggers
+- Derived state: Store expressions, compute results
+- Post-quantum: Dilithium3 signatures
+- Robust networking: Connection pooling, message framing, reconnection
 
-Quorum Node (DIAGON) is a decentralized trust network implementing semantic authentication through a novel challenge-response protocol that combines cryptographic verification with human-in-the-loop elaboration and **democratic genesis governance**. The protocol uses:
+---
 
-- **Pool commitments** for genesis phrase verification (SHA-256)
-- **Dilithium3** post-quantum signatures for all network actions
-- **Mandatory natural language elaboration** to establish trust relationships
-- **Trust scoring** based on elaboration quality (vocabulary diversity + substance)
-- **Democratic pruning** for collective content moderation
-- **DIDs & CIDs** similar to Bluesky for identity and content addressing
-- **Byzantine fault-tolerant voting** (67% threshold) for network governance
+## Overview
 
-## Philosophy
+DIAGON is a peer-to-peer governance system built on biological consensus metaphors. Nodes form authenticated mesh networks within "pools" (trust domains), propose and vote on expressions using quorum sensing, and maintain replicated expression stores with content-addressed identities.
 
-> "Organization through democracy, Trust through mathematics, Meaning through elaboration"
-
-**The Quorum Node Thesis**: True decentralized trust emerges not from eliminating human judgment but from structuring it through democratic processes, cryptographic verification, and semantic elaboration. The network becomes a living system where trust domains can grow, merge, and evolve based on collective human wisdom rather than algorithmic decree.
-
-*Knowledge wants freedom. Trust requires verifiable proof.*
-
-## Features
-
-- **Post-Quantum Security**: Dilithium3 lattice-based signatures resistant to quantum attacks
-- **Content Addressing**: Deterministic CIDs derived from content + timestamp + creator
-- **Decentralized Identity**: DIDs derived from public keys (`did:diagon:<hash>`)
-- **Trust Scoring**: Elaboration quality measured by vocabulary diversity and substance
-- **Trust-Gated Proposals**: Participation rights earned through quality contributions
-- **Democratic Pruning**: Community-voted content removal with re-addition prevention
-- **Pool Isolation**: Networks isolated by shared passphrase commitment
-- **State Sync**: Automatic synchronization of entries on peer connection
-- **Validated Persistence**: Signature verification on state reload (corrupted entries rejected)
-- **Atomic Persistence**: Crash-safe identity and governance state storage
-- **Cross-Platform**: Windows and Unix support with graceful shutdown handling
-
-## What's New in 0.5.1
-
-| Feature | Description |
-|---------|-------------|
-| **Trust Scoring** | `score_elaboration()` measures vocabulary diversity + length; scores range 0.0-1.0 |
-| **Trust-Gated Proposals** | Must have trust ≥ 0.4 to create proposals or prune requests |
-| **Democratic Pruning** | `EntryType::Prune` allows community to vote on content removal |
-| **Entry Type Tracking** | Proposals store their `entry_type` for proper execution logic |
-| **Validated Persistence** | Entries verified (CID + signature) on reload; invalid entries rejected |
-| **Pruned CID Tracking** | Removed content cannot be re-added to the network |
+The system uses S-expressions as its fundamental data structure, enabling homoiconic representation where proposals, votes, and all protocol messages share a unified format.
 
 ## Architecture
 
+### Identity
+
+- **DID (Decentralized Identifier)**: Derived from Dilithium3 public key (`did:diagon:<hex>`)
+- **Post-quantum signatures**: All authentication and message signing uses Dilithium3
+- **Key persistence**: Identity survives restarts via CBOR-serialized state
+
+### Expression Store
+
+- **Content-addressed**: Every expression has a unique CID (SHA256 hash including nonce and timestamp)
+- **Arena allocator**: Efficient S-expression memory management with interning
+- **Merkle root**: Log of all expressions produces a verifiable state commitment
+- **Automatic deduplication**: Identical expressions resolve to same CID
+
+### Quorum Sensing
+
+Inspired by bacterial quorum sensing, consensus emerges from accumulated signals:
+
+- **Threshold**: `⌈(peer_count + 1) × 0.67 × 1000⌉` (minimum 1000)
+- **Signal decay**: Exponential with 5-minute half-life
+- **Weight**: Based on sender's epigenetic mark (trust score)
+- **One vote per source**: Duplicate signals from same DID are rejected
+
+### Epigenetic Marks (Trust)
+
+Trust scores evolve based on participation quality:
+
+- **Default**: 0.5
+- **Update formula**: `score = score × 0.7 + quality × 0.3`
+- **Decay**: Score decays toward baseline when inactive
+- **Signal weight**: `max(score × 1000, 100)`
+- **Proposal threshold**: Trust ≥ 0.4 required to propose
+
+### Pools
+
+Pools are trust domains defined by shared passphrases:
+
+- **Commitment**: `SHA256(passphrase)` identifies the pool
+- **Genesis pools**: Three hardcoded pools bootstrap the network
+- **Dynamic pools**: New pools can be proposed and voted into existence
+- **Isolation**: Nodes only connect to peers in the same pool
+
+## Network Protocol
+
+### Connection Lifecycle
+
+1. **TCP Connect**: Initiator connects to receiver
+2. **Hello Exchange**: Both sides send `Hello { did, pubkey, pool, expr_root }`
+3. **Challenge-Response**: Cryptographic verification via signed nonces
+4. **Elaboration (HITL)**: Initiator must provide human-written elaboration (≥20 chars)
+5. **Approval/Rejection**: Receiver manually approves or rejects with reason
+6. **Authenticated**: Connection enters full mesh participation
+
+### Message Types
+
+| Message | Direction | Purpose |
+|---------|-----------|---------|
+| `Hello` | Bidirectional | Identity and pool announcement |
+| `Challenge` | Receiver → Initiator | 32-byte nonce for signature |
+| `Response` | Initiator → Receiver | Signed nonce proof |
+| `ElaborateRequest` | Receiver → Initiator | Request human elaboration |
+| `Elaborate` | Initiator → Receiver | Signed elaboration text |
+| `Approve` | Receiver → Initiator | Accept peer into mesh |
+| `Reject` | Receiver → Initiator | Deny with reason |
+| `Expression` | Broadcast | New S-expression to replicate |
+| `Signal` | Broadcast | Quorum vote signal |
+| `SyncRequest` | Any → Any | Request missing expressions |
+| `SyncReply` | Any → Any | Batch of expressions |
+| `Heartbeat` | Broadcast | Keep-alive (30s interval) |
+| `Disconnect` | Any → Any | Graceful shutdown |
+
+### Framing
+
+All messages are length-prefixed:
+- 4-byte big-endian length header
+- Maximum message size: 1 MB
+- Non-blocking I/O with 100ms read timeout
+
+### Reliability
+
+- **Connection pool**: Maximum 100 concurrent connections
+- **Automatic reconnection**: Up to 10 attempts with 5s intervals
+- **Peer timeout**: 150 seconds of inactivity triggers disconnect
+- **Challenge timeout**: 30 seconds to complete authentication
+- **Heartbeat**: 30-second interval keeps connections alive
+- **Sync**: 60-second interval reconciles expression stores
+
+## S-Expression Format
+
+### Node Types
 ```
-+------------------------------------------------------------------+
-|                         Quorum Node                              |
-+------------------------------------------------------------------+
-|  +-------------+  +-------------+  +-------------------------+   |
-|  |  Identity   |  |  Governance |  |      Peer Manager       |   |
-|  |  (Dilithium)|  |    Actor    |  |                         |   |
-|  +-------------+  +-------------+  +-------------------------+   |
-|  | - DID       |  | - Entries   |  | - PeerHandle (light)    |   |
-|  | - Keypair   |  | - Proposals |  | - ConnectionActor       |   |
-|  | - Pool Hash |  | - Trust     |  | - Message Routing       |   |
-|  |             |  | - Pruned    |  | - Heartbeat/Timeout     |   |
-|  +-------------+  +-------------+  +-------------------------+   |
-+------------------------------------------------------------------+
-|                      TCP Mesh Network                            |
-|              (Mutual Challenge-Response Authentication)          |
-+------------------------------------------------------------------+
-```
-
-### Trust System
-
-```
-                    ┌─────────────────────────────────────┐
-                    │         Trust Evolution             │
-                    └─────────────────────────────────────┘
-                                    │
-         ┌──────────────────────────┼──────────────────────────┐
-         │                          │                          │
-         ▼                          ▼                          ▼
-   ┌───────────┐            ┌───────────┐            ┌───────────┐
-   │  Initial  │            │  Quality  │            │   Poor    │
-   │   0.50    │            │  Content  │            │  Content  │
-   └───────────┘            └───────────┘            └───────────┘
-         │                        │                        │
-         │                        ▼                        ▼
-         │                  Trust Rises              Trust Falls
-         │                   (→ 1.0)                  (→ 0.0)
-         │                        │                        │
-         ▼                        ▼                        ▼
-   ┌───────────────────────────────────────────────────────────┐
-   │              Proposal Rights (trust ≥ 0.4)                │
-   │                                                           │
-   │  ✓ Create proposals    ✓ Propose pruning                  │
-   │  ✓ Vote on proposals   ✓ Participate in governance        │
-   └───────────────────────────────────────────────────────────┘
-```
-
-### Protocol Flow
-
-```
-Client                              Server
-  |                                    |
-  |--- Connect(DID, PubKey, Pool) ---->|
-  |                                    | Verify pool commitment
-  |<-- Challenge(Nonce, ServerSig) ----|
-  |     Verify server signature        |
-  |--- Response(Signature, Elab) ----->|
-  |                                    | Verify client signature
-  |                                    | Update trust from elaboration
-  |<-- Authenticated(ServerDID) -------|
-  |                                    |
-  |--- SyncRequest(KnownCIDs) -------->|
-  |<-- SyncReply(MissingEntries) ------|
-  |                                    |
-```
-
-### Prune Lifecycle
-
-```
-  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-  │   Content   │────▶│   Prune     │────▶│   Voting    │
-  │   Exists    │     │  Proposed   │     │  (67%+)     │
-  └─────────────┘     └─────────────┘     └─────────────┘
-                                                 │
-                                                 ▼
-  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-  │  Re-add     │◀───X│   CID in    │◀────│   Content   │
-  │  Blocked    │     │ pruned_cids │     │   Removed   │
-  └─────────────┘     └─────────────┘     └─────────────┘
-```
-
-## Building
-
-### Prerequisites
-
-- Rust 1.70+ (stable)
-- Cargo
-
-### Compile
-
-```bash
-# Debug build
-cargo build
-
-# Release build (recommended)
-cargo build --release
-```
-
-### Test
-
-```bash
-# Run all tests (single-threaded for network tests)
-cargo test -- --test-threads=1
-
-# With output
-cargo test -- --test-threads=1 --nocapture
+Nil     → ()
+Atom    → symbol
+Int     → 64-bit signed integer
+Bytes   → #x<hex>
+Cons    → (car . cdr)
 ```
 
-### Test Coverage
+### Signed Expressions
 
-| Test | Validates |
-|------|-----------|
-| `test_trust_scoring` | Elaboration quality measurement |
-| `test_trust_gated_proposals` | Trust decay with poor participation |
-| `test_prune_lifecycle` | Full prune→vote→execute→block-readd cycle |
-| `test_entry_type_tracking` | Proposal stores its entry type |
-| `test_persistence_with_validation` | State survives restart with validation |
-| `test_invalid_entry_rejected_on_load` | Corrupted signatures rejected |
-| `test_two_node_with_trust` | Trust updates propagate between nodes |
-| `test_mesh_with_prune` | 3-node network with democratic pruning |
-| `test_identity_persistence` | DID survives restart |
-| `test_signature_verification` | Tampered entries rejected |
-| `test_pool_mismatch_rejected` | Different pools cannot connect |
+All proposals and votes are wrapped in signed envelopes:
+```lisp
+(signed
+  #x<pubkey>
+  #x<signature>
+  <inner-expression>)
+```
+
+### Proposal Format
+```lisp
+(signed #x<pubkey> #x<sig>
+  (propose "proposal text" "elaboration"))
+```
+
+### Vote Format
+```lisp
+(signed #x<pubkey> #x<sig>
+  (vote #x<target-cid> yes|no "elaboration"))
+```
+
+## Commands
+
+### Pool Management
+```
+auth <passphrase>              Authenticate to a pool
+list-pools                     Show active and pending pools
+propose-pool <phrase> - <rationale>   Propose new pool
+vote-pool <id> <y/n> <elaboration>    Vote on pool proposal
+```
+
+### Peer Management
+```
+connect <host:port>            Initiate connection to peer
+elaborate <text>               Send elaboration (min 20 chars)
+approve <id>                   Approve pending peer (by DID prefix or address)
+reject <id> <reason>           Reject pending peer
+```
+
+### Governance
+```
+propose <text>                 Create new proposal (requires trust ≥ 0.4)
+vote <cid> <y/n> <elaboration> Vote on proposal (min 20 char elaboration)
+status                         Show node status, proposals, connections
+```
+
+### Development
+```
+eval <sexp>                    Parse and store S-expression
+help                           Show command list
+quit                           Graceful shutdown
+```
 
 ## Usage
 
 ### Starting a Node
-
 ```bash
-# Start on default port 9090 with default pool
-./target/release/diagon
+# Default: 127.0.0.1:9070, database in ./diagon_db
+cargo run
 
-# Start on specific port with custom pool
-./target/release/diagon 127.0.0.1:9091 my_secret_pool
-
-# Start and connect to existing peer
-./target/release/diagon 127.0.0.1:9092 my_secret_pool 127.0.0.1:9091
+# Custom address and database
+cargo run -- 192.168.1.10:9070 /var/lib/diagon
 ```
 
-### Command Line Interface
-
-Once running, the node accepts these commands:
-
-```
-Commands:
-  propose <text...>                 - Create votable proposal (requires trust >= 0.4)
-  prune <cid> <reason>              - Propose democratic removal (requires trust >= 0.4)
-  knowledge <cat> <concept> <content> <elaboration>
-  vote <cid> <yes|no> <elaboration>
-  connect <addr>
-  status
-  quit
-```
-
-### Examples
-
+### Joining a Network
 ```bash
-# Create a proposal (text must be >= 20 chars, trust must be >= 0.4)
-propose This is a governance proposal that needs community approval
-
-# Add knowledge entry (no trust requirement)
-knowledge Protocol Security "Post-quantum signatures" This elaboration explains the entry
-
-# Vote on a proposal (use CID prefix from status)
-vote a1b2c3d4 yes I support this proposal because it improves security
-
-# Propose removal of harmful content
-prune a1b2c3d4 This content violates our community guidelines and should be removed
-
-# Check node status (shows trust level)
-status
-
-# Connect to another peer
-connect 127.0.0.1:9092
+> auth quantum leap beyond horizon    # Authenticate to genesis pool
+> connect 192.168.1.20:9070           # Connect to peer
+# Wait for elaboration request...
+> elaborate I am joining this network to participate in distributed governance experiments.
+# Wait for approval from peer...
 ```
 
-### Status Output
+### Accepting Peers
+```bash
+# When a peer connects and elaborates, you'll see:
+# 🔔 ELABORATION from abc123...
+#    "Their elaboration text here"
 
-```
-=== NODE STATUS ===
-DID: did:diagon:8425a...16eefb
-Pool: f8797dea588a628f
-Trust: 0.65 (can propose: true)
-Entries: 12 (verified)
-Proposals: 2
-Known pubkeys: 5
-Pruned CIDs: 1
-Peers: 3
-  - did:diagon:f941a..3ba16d (trust: 0.72, seen 5.2s ago)
-  - did:diagon:dbd18..28ed20 (trust: 0.58, seen 2.1s ago)
-  - did:diagon:141c6..5a0792 (trust: 0.44, seen 8.3s ago)
-Active proposals:
-  6e1e7676 [PRUNE] - 2/3 votes
-  a1b2c3d4 [PROPOSAL] - 1/3 votes (EXECUTED)
+> approve abc123                      # Approve by DID prefix
+# or
+> reject abc123 Insufficient elaboration
 ```
 
-## Data Storage
-
-Node data is stored in `db/<address_hash>/`:
-
-```
-db/
-  <hash>/
-    identity.cbor    # Keypair and DID (post-quantum safe)
-    governance.cbor  # Entries, proposals, trust scores, pruned CIDs, pubkeys
+### Creating Proposals
+```bash
+> propose Implement zero-knowledge proof verification for private voting.
+# [PROPOSE] 7f3a2b1c
 ```
 
-### Persistence Format (governance.cbor)
-
-```rust
-SavedState {
-    entries: HashMap<Cid, Entry>,
-    proposals: HashMap<Cid, Proposal>,
-    trust_scores: HashMap<Did, TrustScore>,
-    pruned_cids: HashSet<Cid>,
-    pubkeys: HashMap<Did, Vec<u8>>,
-}
+### Voting
+```bash
+> vote 7f3a y This is essential for privacy-preserving governance systems.
+# [VOTE] YES on 7f3a2b1c
 ```
-
-Identity persists across restarts. State is atomically saved every 30 seconds and on shutdown. On reload, all entries are validated (CID integrity + signature verification).
-
-## Security Model
-
-### Cryptographic Guarantees
-
-| Component | Algorithm | Security Level |
-|-----------|-----------|----------------|
-| Signatures | Dilithium3 | NIST PQC Level 3 |
-| Hashing | SHA-256 | 128-bit collision |
-| Pool Auth | SHA-256 commitment | Pre-image resistant |
-| Comparison | Constant-time XOR | Timing-attack resistant |
-
-### Trust Model
-
-1. **Pool Membership**: Only nodes with matching pool commitment can connect
-2. **Signature Verification**: All entries and votes cryptographically signed
-3. **CID Binding**: Content addresses prevent tampering
-4. **Trust Scoring**: Elaboration quality determines participation rights
-5. **Byzantine Tolerance**: 67% threshold for proposal execution
-6. **Democratic Pruning**: Community can remove content by vote
-7. **Validated Reload**: Corrupted/tampered entries rejected on restart
-
-### Trust Scoring Algorithm
-
-```rust
-fn score_elaboration(text: &str) -> f64 {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let unique: HashSet<&str> = words.iter().copied().collect();
-    
-    // Vocabulary diversity (0.0 - 1.0)
-    let uniqueness = unique.len() as f64 / words.len() as f64;
-    
-    // Substance score, caps at 100 words (0.0 - 1.0)
-    let length_score = (words.len() as f64 / 100.0).min(1.0);
-    
-    // Equal weight to diversity and substance
-    (uniqueness * 0.5 + length_score * 0.5).clamp(0.0, 1.0)
-}
-
-// Trust update: 70% history, 30% new score
-new_trust = (old_trust * 0.7) + (elaboration_score * 0.3)
-```
-
-## Protocol Messages
-
-| Message | Phase | Direction | Purpose |
-|---------|-------|-----------|---------|
-| `Connect` | Auth | C→S | Initiate with DID, pubkey, pool |
-| `Challenge` | Auth | S→C | Send nonce with server signature |
-| `Response` | Auth | C→S | Client signature + elaboration |
-| `Authenticated` | Auth | S→C | Confirm mutual authentication |
-| `Propose` | Gov | Broadcast | Submit new proposal |
-| `Vote` | Gov | Broadcast | Cast signed vote |
-| `SyncRequest` | Sync | C→S | Request missing entries |
-| `SyncReply` | Sync | S→C | Send missing entries |
-| `NewEntry` | Sync | Broadcast | Propagate new entry |
-| `Heartbeat` | Keep | Both | Connection liveness (30s) |
-
-## Entry Types
-
-| Type | Votable | Purpose |
-|------|---------|---------|
-| `Knowledge` | No | Store categorized information |
-| `Proposal` | Yes | Governance decisions requiring consensus |
-| `Prune` | Yes | Democratic content removal |
 
 ## Configuration Constants
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `MAX_MESSAGE_SIZE` | 1MB | Maximum protocol message |
-| `AUTH_TIMEOUT_SECS` | 30s | Handshake timeout |
-| `MIN_ELABORATION_LEN` | 20 | Minimum elaboration length |
-| `MAX_ELABORATION_LEN` | 10KB | Maximum elaboration length |
-| `MAX_ENTRY_DATA_SIZE` | 60KB | Maximum entry payload |
-| `HEARTBEAT_SECS` | 30s | Keepalive interval |
-| `PEER_TIMEOUT_SECS` | 150s | Peer inactivity timeout |
-| `MAX_TIMESTAMP_DRIFT_SECS` | 300s | Clock skew tolerance |
-| `MIN_TRUST_FOR_PROPOSALS` | 0.4 | Trust threshold for proposals |
-| `INITIAL_TRUST` | 0.5 | Starting trust for new participants |
+| `EIGEN_THRESHOLD` | 0.67 | Quorum threshold (67%) |
+| `SIGNAL_HALF_LIFE` | 300s | Vote decay half-life |
+| `HEARTBEAT_INTERVAL` | 30s | Keep-alive frequency |
+| `SYNC_INTERVAL` | 60s | Expression sync frequency |
+| `PEER_TIMEOUT_SECS` | 150s | Inactivity disconnect |
+| `CHALLENGE_TIMEOUT_SECS` | 30s | Auth challenge expiry |
+| `MIN_ELABORATION_LEN` | 20 | Minimum elaboration characters |
+| `MAX_MESSAGE_SIZE` | 1 MB | Maximum network message |
+| `MAX_CONNECTIONS` | 100 | Connection pool limit |
+| `TRUST_DEFAULT` | 0.5 | Initial trust score |
+| `TRUST_MIN_FOR_PROPOSE` | 0.4 | Minimum trust to propose |
 
-## Changelog
+## Persistence
 
-### v0.5.1
-- Added trust scoring based on elaboration quality
-- Added trust-gated proposals (requires trust ≥ 0.4)
-- Added democratic pruning with `EntryType::Prune`
-- Added entry type tracking in proposals
-- Added validated persistence (signature verification on reload)
-- Added pruned CID tracking to prevent re-addition
-- Enhanced status output with trust levels
+State is persisted to `<db_path>/state.cbor` using atomic writes:
 
-### v0.5.0
-- Actor-based architecture with PeerHandle/ConnectionActor separation
-- Mutual authentication (server proves identity)
-- Constant-time pool comparison
-- Deterministic CID generation
-- Improved Windows compatibility
+- Identity (keypair, DID)
+- All expressions with CIDs
+- Proposal states and quorum progress
+- Pool proposals and active pools
+- Epigenetic marks for all known DIDs
+- Nonce counter for CID generation
 
-## License
+## Testing
+```bash
+# Run all tests (single-threaded for network tests)
+cargo test -- --nocapture --test-threads=1
 
-Custom GNU-LGPL
+# Individual tests
+cargo test test_node_creation
+cargo test test_pool_authentication
+cargo test test_sexp_arena
+cargo test test_expression_store
+cargo test test_quorum_sensing
+cargo test test_three_node_mesh
+```
 
----
+## Dependencies
 
-*"In the struggle between truth and deception, let mathematics be the arbiter."*
+- `sha2`: SHA-256 hashing
+- `pqcrypto-dilithium`: Post-quantum Dilithium3 signatures
+- `serde`, `bincode`, `serde_cbor`: Serialization
+- `rand`: Cryptographic randomness
+
+## Genesis Pools
+
+Three pools are active at genesis (commitments shown):
+```
+#1 801e100b... [genesis]
+#2 93a780b1... [genesis]
+#3 c78dec83... [genesis]
+```
+
+Contact existing network participants to obtain genesis passphrases.
