@@ -4,6 +4,12 @@
 
 *"In the struggle between truth and deception, let mathematics be the arbiter."*
 
+## Overview
+
+DIAGON is a peer-to-peer governance system built on biological consensus metaphors. Nodes form authenticated mesh networks within "pools" (trust domains), propose and vote on expressions using quorum sensing, and maintain replicated expression stores with content-addressed identities.
+
+The system uses S-expressions as its fundamental data structure, enabling homoiconic representation where proposals, votes, and all protocol messages share a unified format.
+
 Core principles:
 - Homoiconicity: Code is data, data is code
 - Content-addressing: The expression IS its identity
@@ -11,14 +17,6 @@ Core principles:
 - Derived state: Store expressions, compute results
 - Post-quantum: Dilithium3 signatures
 - Robust networking: Connection pooling, message framing, reconnection
-
----
-
-## Overview
-
-DIAGON is a peer-to-peer governance system built on biological consensus metaphors. Nodes form authenticated mesh networks within "pools" (trust domains), propose and vote on expressions using quorum sensing, and maintain replicated expression stores with content-addressed identities.
-
-The system uses S-expressions as its fundamental data structure, enabling homoiconic representation where proposals, votes, and all protocol messages share a unified format.
 
 ## Architecture
 
@@ -274,3 +272,40 @@ Three pools are active at genesis (commitments shown):
 ```
 
 Contact existing network participants to obtain genesis passphrases.
+
+## Architectural Manifest
+
+```
+I created DIAGON out of fear and passion.
+
+Fear for democracy, fear for future generations, and fear of the wide and deep trenches of the powerful.
+
+Passion to secure a future of equal representation, and to reach a collective consciousness.
+
+How can the common person survive in this environment? If we are to do the same to information as we did to the working man's motivation, meaning we slowly and painfully degrade its worth, what is left?
+
+I would argue there is only the ephemeral left. Pleasing constructions of the natural world produced by the human mind, surrounded on all sides by ten-foot-deep concrete, insulated from any future change.
+
+Increasingly, we are relying on centralized computing services, which means we are building trust and a dialectical connection to these service providers.
+
+Worse still, we seem to operate on two new forms of capital: attention as capital, and the capital that arises from the vicious profit-taking cycle of endless online platforms as markets, with only the smaller slice being paid to individuals.
+
+Tangentially, if we are to insulate from change, often we seek a saviour, however, when centralized services can no longer be trusted not to take advantage of their congregation, one must act on their own.
+
+The problem is, we cannot achieve anything worthwhile alone. More importantly, the more separate we become, the more prone we are to being manipulated.
+
+The only solution seems like organization, but how do we prevent the same centralization problem?
+
+Scale is not neutral. Scale advantages those who can afford to operate at scale. A system that cannot be gamed by volume is a system that preserves the voice of individuals against coordinated capital. Frictionless systems are capturable systems. Every bot army, every astroturf campaign, every coordinated inauthentic behavior exploits low barriers to entry. Friction is not a bug. It is the immune system.
+
+Primarily, we need to organize and preserve things of importance democratically, before the perceived capital of humankind reaches the gates of the greedy and powerful.
+
+What is happening is enclosure. The same pattern that privatized common land in 17th century England now operates on information. Wikipedia remains a rare holdout. Everything else got enclosed. Market makers have said that the final frontier for capital is information, and they seem intent on capturing as much as possible ahead of time.
+
+The problem is the truth evolves, and it's never well represented with only a single perspective. Centralized platforms optimize for the present. They have no mechanism for revision, retraction, evolution. Consensus that forms today may dissolve tomorrow as understanding deepens. This is not a flaw. Reality updates. Our systems should too.
+
+In order to prevent central services from enclosing every last bit of information as capital, distributed networks capable of democratic governance over particularly truthful and important sets of information should be established and rewarded for continued service.
+
+  - Quorum IO
+
+```
