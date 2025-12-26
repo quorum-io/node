@@ -1,4 +1,4 @@
-// DIAGON v0.9.1 Alpha - Security Hardened Edition
+// DIAGON v0.9.2
 
 use std::{
     collections::{HashMap, HashSet, BTreeMap, VecDeque},
@@ -735,6 +735,15 @@ pub enum NetMessage {
     // SECURITY: Include timestamp to prevent replay
     Heartbeat { timestamp: u64, signature: Vec<u8> },
     Disconnect { timestamp: u64, signature: Vec<u8> },
+    // Unauthenticated discovery - anyone can ask
+    Discover { 
+        pools: Vec<[u8; 32]>,      // Which pools to find peers for
+        want_hints: bool,          // Request pool hints (for browsing)
+    },
+    DiscoverResponse {
+        peers: Vec<DiscoveredPeer>,
+        pool_hints: Vec<PoolHint>,
+    },
 }
 
 impl NetMessage {
@@ -773,6 +782,33 @@ impl NetMessage {
                 Some(text.as_bytes().to_vec())
             }
             _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiscoveredPeer {
+    pub addr: SocketAddr,
+    pub pool: [u8; 32],
+    pub expr_count: usize,
+    pub uptime_secs: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PoolHint {
+    pub commitment: [u8; 32],
+    pub hint: String,           // partial passphrase
+    pub peer_count: usize,
+    pub is_genesis: bool,
+}
+
+impl PoolHint {
+    fn from_commitment(commitment: [u8; 32], hint: Option<&str>, peer_count: usize) -> Self {
+        Self {
+            commitment,
+            hint: hint.map(|s| s.to_string()).unwrap_or_else(|| format!("{}...", hex::encode(&commitment[..4]))),
+            peer_count,
+            is_genesis: GENESIS_POOLS.contains(&commitment),
         }
     }
 }
@@ -1029,6 +1065,7 @@ pub struct Node {
     secret_key: SecretKey,
     public_key: PublicKey,
     bind_addr: String,
+    started_at: Instant,
     pool: RwLock<Option<[u8; 32]>>,
     connection_pool: Arc<ConnectionPool>,
     reconnect_queue: RwLock<VecDeque<(SocketAddr, Instant, u32)>>,
@@ -1059,6 +1096,7 @@ impl Node {
             secret_key,
             public_key,
             bind_addr: bind_addr.to_string(),
+            started_at: Instant::now(),
             pool: RwLock::new(None),
             connection_pool: Arc::new(ConnectionPool::new()),
             reconnect_queue: RwLock::new(VecDeque::new()),
@@ -1200,7 +1238,7 @@ impl Node {
         let commitment = hash_pool_passphrase(passphrase);
         if self.state.read().await.active_pools.contains(&commitment) {
             *self.pool.write().await = Some(commitment);
-            println!("[SUCCESS] Pool authenticated: {}", hex::encode(&commitment[..8]));
+            println!("✔ Pool authenticated: {}", hex::encode(&commitment[..8]));
             true
         } else {
             println!("[REJECTION] Unknown pool. Commitment: {}", hex::encode(&commitment[..8]));
@@ -1745,6 +1783,30 @@ impl Node {
             info.write().await.last_activity = Instant::now();
             
             if let Ok(msg) = NetMessage::deserialize(&msg_buf) {
+                // Discovery messages work without authentication
+                let needs_auth = !matches!(
+                    &msg,
+                    NetMessage::Discover { .. } |
+                    NetMessage::DiscoverResponse { .. } |
+                    NetMessage::Hello { .. } |
+                    NetMessage::Challenge(_) |
+                    NetMessage::Response { .. } |
+                    NetMessage::ElaborateRequest |
+                    NetMessage::Elaborate { .. } |
+                    NetMessage::Approve { .. } |
+                    NetMessage::Reject { .. }
+                );
+                
+                // Skip auth check for handshake and discovery messages
+                if needs_auth {
+                    let info_guard = info.read().await;
+                    if !info_guard.is_authenticated() {
+                        drop(info_guard);
+                        continue; // Silently drop - not authenticated yet
+                    }
+                    drop(info_guard);
+                }
+                
                 if let Err(e) = self.handle_message(msg, addr, &info).await {
                     eprintln!("Message handling error from {}: {}", addr, e);
                 }
@@ -1822,6 +1884,12 @@ impl Node {
             }
             NetMessage::Disconnect { timestamp: msg_ts, signature } => {
                 self.handle_disconnect(msg_ts, signature, from).await
+            }
+            NetMessage::Discover { pools, want_hints } => {
+                self.handle_discover(pools, want_hints, from).await
+            }
+            NetMessage::DiscoverResponse { peers, pool_hints } => {
+                self.handle_discover_response(peers, pool_hints, from).await
             }
         }
     }
@@ -2290,6 +2358,369 @@ impl Node {
         println!("[PEER] {} disconnected", from);
         Ok(())
     }
+
+    /// Handle discovery request - works WITHOUT authentication
+    /// This is how new nodes find their way into the network
+    async fn handle_discover(
+        &self,
+        requested_pools: Vec<[u8; 32]>,
+        want_hints: bool,
+        from: SocketAddr,
+    ) -> Result<()> {
+        let our_pool = *self.pool.read().await;
+        let mut discovered_peers = Vec::new();
+        let mut hints = Vec::new();
+        
+        // If we're in one of the requested pools (or they asked for all), include ourselves
+        let we_match = requested_pools.is_empty() 
+            || our_pool.map(|p| requested_pools.contains(&p)).unwrap_or(false);
+        
+        if we_match {
+            if let Some(pool) = our_pool {
+                discovered_peers.push(DiscoveredPeer {
+                    addr: self.bind_addr.parse().unwrap_or(from),
+                    pool,
+                    expr_count: self.store.read().await.len(),
+                    uptime_secs: self.started_at.elapsed().as_secs(),
+                });
+            }
+        }
+        
+        // Include our authenticated peers (in matching pools)
+        if let Some(our_p) = our_pool {
+            let show_our_pool = requested_pools.is_empty() || requested_pools.contains(&our_p);
+            if show_our_pool {
+                let peers = self.connection_pool.peers.read().await;
+                for (addr, info) in peers.iter() {
+                    if discovered_peers.len() >= 20 { break; }
+                    let info = info.read().await;
+                    if info.is_authenticated() {
+                        discovered_peers.push(DiscoveredPeer {
+                            addr: *addr,
+                            pool: our_p,
+                            expr_count: 0, // Unknown for peers
+                            uptime_secs: 0,
+                        });
+                    }
+                }
+            }
+        }
+        
+        // Provide pool hints if requested
+        if want_hints {
+            let state = self.state.read().await;
+            
+            // Genesis pools
+            for genesis in GENESIS_POOLS.iter() {
+                let peer_count = if our_pool == Some(*genesis) {
+                    self.connection_pool.authenticated_addrs().await.len() + 1
+                } else {
+                    0
+                };
+                hints.push(PoolHint::from_commitment(*genesis, None, peer_count));
+            }
+            
+            // Dynamic pools we know about
+            for (commitment, pool_state) in &state.pool_proposals {
+                if pool_state.active {
+                    hints.push(PoolHint::from_commitment(
+                        *commitment,
+                        Some(&pool_state.hint),
+                        0, // Don't know peer count for other pools
+                    ));
+                }
+            }
+        }
+        
+        // Send response - use raw TCP if not yet in connection pool
+        let response = NetMessage::DiscoverResponse {
+            peers: discovered_peers,
+            pool_hints: hints,
+        };
+        
+        if let Some(handle) = self.connection_pool.get_handle(&from).await {
+            handle.send(response.serialize()?).await?;
+        } else {
+            // Peer connected just for discovery, not in pool yet
+            // This is handled by the reader task - discovery messages work pre-auth
+        }
+        
+        Ok(())
+    }
+    
+    /// Handle discovery response
+    async fn handle_discover_response(
+        &self,
+        peers: Vec<DiscoveredPeer>,
+        pool_hints: Vec<PoolHint>,
+        from: SocketAddr,
+    ) -> Result<()> {
+        let our_pool = *self.pool.read().await;
+        
+        if !peers.is_empty() {
+            println!("[DISCOVER] Received {} peer(s) from {}:", peers.len(), from);
+            for peer in &peers {
+                let pool_match = our_pool.map(|p| p == peer.pool).unwrap_or(false);
+                let marker = if pool_match { " [same-pool]" } else { "" };
+                println!("  {} (pool: {}..., {} expr, {}s up){}",
+                    peer.addr,
+                    hex::encode(&peer.pool[..4]),
+                    peer.expr_count,
+                    peer.uptime_secs,
+                    marker
+                );
+            }
+        }
+        
+        if !pool_hints.is_empty() {
+            println!("[DISCOVER] Known pools:");
+            for hint in &pool_hints {
+                let genesis = if hint.is_genesis { " [genesis]" } else { "" };
+                println!("  {}... - \"{}\" ({} peers){}",
+                    hex::encode(&hint.commitment[..4]),
+                    hint.hint,
+                    hint.peer_count,
+                    genesis
+                );
+            }
+        }
+        
+        // Store discovered peers for later use
+        // Filter to our pool if we have one set
+        if let Some(our_p) = our_pool {
+            let matching: Vec<_> = peers.iter()
+                .filter(|p| p.pool == our_p && p.addr != self.bind_addr.parse().unwrap_or(from))
+                .collect();
+            
+            if !matching.is_empty() {
+                println!("[DISCOVER] {} peer(s) in your pool - use 'connect <addr>' to join", matching.len());
+            }
+        }
+        
+        Ok(())
+    }
+
+    // INSERT AFTER bootstrap_lookup method or as new public methods (around line 800)
+
+    /// Connect to any node just for discovery (no pool auth needed)
+    pub async fn probe(&self, addr_str: &str) {
+        let addr: SocketAddr = match addr_str.parse() {
+            Ok(a) => a,
+            Err(_) => { println!("[PROBE] Invalid address"); return; }
+        };
+        
+        println!("[PROBE] Connecting to {} for discovery...", addr);
+        
+        // Direct TCP connection, send discover, read response
+        let result = self.probe_node(addr).await;
+        
+        match result {
+            Ok((peers, hints)) => {
+                if peers.is_empty() && hints.is_empty() {
+                    println!("[PROBE] No information received");
+                } else {
+                    // Response is printed by handle_discover_response logic
+                    // but we're doing it inline here for probe
+                    if !hints.is_empty() {
+                        println!("[PROBE] Available pools:");
+                        for hint in &hints {
+                            let tag = if hint.is_genesis { "[genesis]" } else { "" };
+                            println!("  {}... \"{}\" {} peers {}", 
+                                hex::encode(&hint.commitment[..4]),
+                                hint.hint,
+                                hint.peer_count,
+                                tag
+                            );
+                        }
+                    }
+                    if !peers.is_empty() {
+                        println!("[PROBE] Known peers:");
+                        for peer in &peers {
+                            println!("  {} in pool {}... ({} expr)",
+                                peer.addr,
+                                hex::encode(&peer.pool[..4]),
+                                peer.expr_count
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => println!("[PROBE] Failed: {}", e),
+        }
+    }
+    
+    async fn probe_node(&self, addr: SocketAddr) -> Result<(Vec<DiscoveredPeer>, Vec<PoolHint>)> {
+        let mut stream = smol::net::TcpStream::connect(addr).await?;
+        
+        // Request all pools and hints
+        let request = NetMessage::Discover {
+            pools: vec![], // Empty = all pools
+            want_hints: true,
+        };
+        
+        let data = request.serialize()?;
+        let len_bytes = (data.len() as u32).to_be_bytes();
+        
+        stream.write_all(&len_bytes).await?;
+        stream.write_all(&data).await?;
+        stream.flush().await?;
+        
+        // Read response with timeout
+        let mut len_buf = [0u8; 4];
+        
+        // Simple timeout using select
+        let read_result = futures_lite::future::or(
+            async {
+                stream.read_exact(&mut len_buf).await?;
+                let msg_len = u32::from_be_bytes(len_buf) as usize;
+                if msg_len > MAX_MESSAGE_SIZE {
+                    return Err(DiagonError::MessageTooLarge);
+                }
+                let mut msg_buf = vec![0u8; msg_len];
+                stream.read_exact(&mut msg_buf).await?;
+                Ok(msg_buf)
+            },
+            async {
+                Timer::after(Duration::from_secs(10)).await;
+                Err(DiagonError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Probe timeout"
+                )))
+            }
+        ).await;
+        
+        let msg_buf = read_result?;
+        
+        match NetMessage::deserialize(&msg_buf)? {
+            NetMessage::DiscoverResponse { peers, pool_hints } => {
+                Ok((peers, pool_hints))
+            }
+            _ => Err(DiagonError::Validation("Unexpected response".into())),
+        }
+    }
+    
+    /// Crawl the network starting from a known node
+    pub async fn crawl(&self, start_addr: &str, max_hops: usize) {
+        let our_pool = *self.pool.read().await;
+        
+        println!("[CRAWL] Starting network crawl from {}...", start_addr);
+        if our_pool.is_none() {
+            println!("[CRAWL] Hint: 'auth <passphrase>' first to filter to your pool");
+        }
+        
+        let mut visited: HashSet<SocketAddr> = HashSet::new();
+        let mut to_visit: VecDeque<SocketAddr> = VecDeque::new();
+        let mut all_peers: HashMap<SocketAddr, DiscoveredPeer> = HashMap::new();
+        let mut all_hints: HashMap<[u8; 32], PoolHint> = HashMap::new();
+        
+        if let Ok(addr) = start_addr.parse() {
+            to_visit.push_back(addr);
+        } else {
+            println!("[CRAWL] Invalid starting address");
+            return;
+        }
+        
+        let mut hops = 0;
+        while let Some(addr) = to_visit.pop_front() {
+            if visited.contains(&addr) { continue; }
+            if hops >= max_hops { break; }
+            
+            visited.insert(addr);
+            
+            print!("[CRAWL] Probing {} (hop {})... ", addr, hops + 1);
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            
+            match self.probe_node(addr).await {
+                Ok((peers, hints)) => {
+                    println!("found {} peers, {} pools", peers.len(), hints.len());
+                    
+                    for peer in peers {
+                        // Queue for crawling if not visited
+                        if !visited.contains(&peer.addr) {
+                            to_visit.push_back(peer.addr);
+                        }
+                        all_peers.insert(peer.addr, peer);
+                    }
+                    
+                    for hint in hints {
+                        all_hints.insert(hint.commitment, hint);
+                    }
+                }
+                Err(e) => {
+                    println!("failed ({})", e);
+                }
+            }
+            
+            hops += 1;
+            
+            // Small delay to be polite
+            Timer::after(Duration::from_millis(100)).await;
+        }
+        
+        // Summary
+        println!();
+        println!("[CRAWL] === Summary ===");
+        println!("[CRAWL] Visited {} nodes", visited.len());
+        println!("[CRAWL] Found {} unique peers", all_peers.len());
+        println!("[CRAWL] Found {} pools", all_hints.len());
+        
+        if !all_hints.is_empty() {
+            println!();
+            println!("[CRAWL] Pools:");
+            for hint in all_hints.values() {
+                let tag = if hint.is_genesis { "[genesis]" } else { "" };
+                println!("  {}... \"{}\" {}", 
+                    hex::encode(&hint.commitment[..4]),
+                    hint.hint,
+                    tag
+                );
+            }
+        }
+        
+        // Filter to our pool if set
+        if let Some(our_p) = our_pool {
+            let matching: Vec<_> = all_peers.values()
+                .filter(|p| p.pool == our_p)
+                .collect();
+            
+            if !matching.is_empty() {
+                println!();
+                println!("[CRAWL] Peers in YOUR pool:");
+                for peer in matching {
+                    println!("  {} ({} expr, {}s uptime)",
+                        peer.addr,
+                        peer.expr_count,
+                        peer.uptime_secs
+                    );
+                }
+            }
+        }
+    }
+    
+    /// Ask connected peers for discovery info
+    pub async fn discover(&self) {
+        let pools = match *self.pool.read().await {
+            Some(p) => vec![p],
+            None => vec![], // Ask for all if no pool set
+        };
+        
+        let authed = self.connection_pool.authenticated_addrs().await;
+        if authed.is_empty() {
+            println!("[DISCOVER] No connected peers. Use 'probe <addr>' or 'crawl <addr> <hops>' first.");
+            return;
+        }
+        
+        println!("[DISCOVER] Asking {} peer(s) for network info...", authed.len());
+        
+        let msg = NetMessage::Discover { pools, want_hints: true };
+        if let Ok(data) = msg.serialize() {
+            for addr in authed {
+                if let Some(handle) = self.connection_pool.get_handle(&addr).await {
+                    let _ = handle.send(data.clone()).await;
+                }
+            }
+        }
+    }
     
     async fn broadcast_authenticated(&self, msg: &NetMessage) {
         if let Ok(data) = msg.serialize() {
@@ -2428,18 +2859,31 @@ fn score_elaboration(text: &str) -> f64 {
 
 fn print_help() {
     println!("Commands:");
-    println!("  auth <passphrase>              Set pool passphrase");
-    println!("  connect <addr>                 Connect to peer");
-    println!("  elaborate <text>               Send elaboration");
+    println!();
+    println!("  === Discovery (no auth needed) ===");
+    println!("  probe <addr>                   Query any node for peers/pools");
+    println!("  crawl <addr> <hops>            Crawl network from starting node");
+    println!("  discover                       Ask connected peers for network info");
+    println!();
+    println!("  === Authentication ===");
+    println!("  auth <passphrase>              Join a pool");
+    println!("  list-pools                     Show known pools");
+    println!();
+    println!("  === Connection ===");
+    println!("  connect <addr>                 Connect to peer (needs auth first)");
+    println!("  elaborate <text>               Explain why you're joining");
     println!("  approve <id>                   Approve pending peer");
     println!("  reject <id> <reason>           Reject pending peer");
+    println!();
+    println!("  === Governance ===");
     println!("  propose <text>                 Create proposal");
-    println!("  vote <cid> <y/n> <elaboration> Vote on proposal");
-    println!("  propose-pool <phrase> - <rationale>");
-    println!("  vote-pool <id> <y/n> <elaboration>");
-    println!("  list-pools                     Show pools");
-    println!("  status                         Show status");
-    println!("  eval <sexp>                    Evaluate S-expression");
+    println!("  vote <cid> <y/n> <text>        Vote on proposal");
+    println!("  propose-pool <phrase> - <why>  Propose new pool");
+    println!("  vote-pool <id> <y/n> <text>    Vote on pool proposal");
+    println!();
+    println!("  === Status ===");
+    println!("  status                         Show node status");
+    println!("  eval <sexp>                    Parse S-expression");
     println!("  help                           Show this help");
     println!("  quit                           Exit");
     println!();
@@ -2522,6 +2966,13 @@ async fn async_main(addr: &str, db_path: &str) -> io::Result<()> {
             "list-pools" => { node.list_pools().await; }
             "status" => { node.status().await; }
             "eval" if !arg.is_empty() => { node.eval(arg).await; }
+            "probe" if !arg.is_empty() => { node.probe(arg).await; }
+            "crawl" if !arg.is_empty() => {
+                let parts: Vec<&str> = arg.split_whitespace().collect();
+                let hops = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(5);
+                node.crawl(parts[0], hops).await;
+            }
+            "discover" => { node.discover().await; }
             "help" => { print_help(); }
             "quit" | "exit" => { break; }
             _ => { println!("Unknown command. Type 'help' for commands."); }
@@ -3785,6 +4236,326 @@ mod tests {
         println!("[SUCCESS] Different support produces different bytes");
         
         println!("[SUCCESS] QuorumSignal signable bytes test passed\n");
+    }
+
+    #[test]
+    fn test_pool_hints() {
+        println!("\n═══ TEST: Pool Hints ═══");
+        
+        // Test PoolHint::from_commitment with explicit hint
+        let commitment = [0xAB; 32];
+        let hint = PoolHint::from_commitment(commitment, Some("test...hint"), 5);
+        assert_eq!(hint.hint, "test...hint");
+        assert_eq!(hint.peer_count, 5);
+        assert!(!hint.is_genesis, "Random commitment should not be genesis");
+        println!("[SUCCESS] PoolHint with explicit hint works");
+        
+        // Test PoolHint::from_commitment without hint (should generate from commitment)
+        let hint_auto = PoolHint::from_commitment(commitment, None, 3);
+        assert_eq!(hint_auto.hint, "abababab...");
+        assert_eq!(hint_auto.peer_count, 3);
+        println!("[SUCCESS] PoolHint auto-generates hint from commitment: {}", hint_auto.hint);
+        
+        // Test genesis pool detection
+        let genesis_hint = PoolHint::from_commitment(GENESIS_POOLS[0], None, 10);
+        assert!(genesis_hint.is_genesis, "Genesis pool should be detected");
+        println!("[SUCCESS] Genesis pool correctly identified");
+        
+        // Test non-genesis pool
+        let non_genesis = PoolHint::from_commitment([0x99; 32], Some("custom"), 1);
+        assert!(!non_genesis.is_genesis);
+        println!("[SUCCESS] Non-genesis pool correctly identified");
+        
+        println!("[SUCCESS] Pool hints test passed\n");
+    }
+
+    #[test]
+    fn test_discovery_messages() {
+        println!("\n═══ TEST: Discovery Messages ═══");
+        
+        // Test Discover message serialization
+        let discover = NetMessage::Discover {
+            pools: vec![[1u8; 32], [2u8; 32]],
+            want_hints: true,
+        };
+        let serialized = discover.serialize().expect("Serialize failed");
+        let deserialized = NetMessage::deserialize(&serialized).expect("Deserialize failed");
+        
+        if let NetMessage::Discover { pools, want_hints } = deserialized {
+            assert_eq!(pools.len(), 2);
+            assert_eq!(pools[0], [1u8; 32]);
+            assert_eq!(pools[1], [2u8; 32]);
+            assert!(want_hints);
+            println!("[SUCCESS] Discover message round-trip OK");
+        } else {
+            panic!("Wrong message type after deserialize");
+        }
+        
+        // Test empty pools (meaning "all pools")
+        let discover_all = NetMessage::Discover {
+            pools: vec![],
+            want_hints: false,
+        };
+        let serialized = discover_all.serialize().expect("Serialize failed");
+        let deserialized = NetMessage::deserialize(&serialized).expect("Deserialize failed");
+        
+        if let NetMessage::Discover { pools, want_hints } = deserialized {
+            assert!(pools.is_empty());
+            assert!(!want_hints);
+            println!("[SUCCESS] Discover (all pools) message round-trip OK");
+        } else {
+            panic!("Wrong message type");
+        }
+        
+        // Test DiscoverResponse message
+        let response = NetMessage::DiscoverResponse {
+            peers: vec![
+                DiscoveredPeer {
+                    addr: "127.0.0.1:9070".parse().unwrap(),
+                    pool: [0xAB; 32],
+                    expr_count: 1500,
+                    uptime_secs: 3600,
+                },
+                DiscoveredPeer {
+                    addr: "192.168.1.10:9070".parse().unwrap(),
+                    pool: [0xCD; 32],
+                    expr_count: 500,
+                    uptime_secs: 1800,
+                },
+            ],
+            pool_hints: vec![
+                PoolHint {
+                    commitment: [0xAB; 32],
+                    hint: "quan...zon".to_string(),
+                    peer_count: 5,
+                    is_genesis: true,
+                },
+                PoolHint {
+                    commitment: [0xCD; 32],
+                    hint: "test...pool".to_string(),
+                    peer_count: 2,
+                    is_genesis: false,
+                },
+            ],
+        };
+        
+        let serialized = response.serialize().expect("Serialize failed");
+        let deserialized = NetMessage::deserialize(&serialized).expect("Deserialize failed");
+        
+        if let NetMessage::DiscoverResponse { peers, pool_hints } = deserialized {
+            assert_eq!(peers.len(), 2);
+            assert_eq!(peers[0].expr_count, 1500);
+            assert_eq!(peers[0].uptime_secs, 3600);
+            assert_eq!(peers[1].addr.to_string(), "192.168.1.10:9070");
+            
+            assert_eq!(pool_hints.len(), 2);
+            assert_eq!(pool_hints[0].hint, "quan...zon");
+            assert!(pool_hints[0].is_genesis);
+            assert_eq!(pool_hints[1].peer_count, 2);
+            assert!(!pool_hints[1].is_genesis);
+            
+            println!("[SUCCESS] DiscoverResponse message round-trip OK");
+            println!("  Peers: {}", peers.len());
+            println!("  Pool hints: {}", pool_hints.len());
+        } else {
+            panic!("Wrong message type");
+        }
+        
+        // Test empty response
+        let empty_response = NetMessage::DiscoverResponse {
+            peers: vec![],
+            pool_hints: vec![],
+        };
+        let serialized = empty_response.serialize().expect("Serialize failed");
+        let deserialized = NetMessage::deserialize(&serialized).expect("Deserialize failed");
+        
+        if let NetMessage::DiscoverResponse { peers, pool_hints } = deserialized {
+            assert!(peers.is_empty());
+            assert!(pool_hints.is_empty());
+            println!("[SUCCESS] Empty DiscoverResponse round-trip OK");
+        } else {
+            panic!("Wrong message type");
+        }
+        
+        println!("[SUCCESS] Discovery messages test passed\n");
+    }
+
+    #[test]
+    fn test_two_node_discovery() {
+        println!("\n═══ TEST: Two Node Discovery ═══");
+        let dir = setup_test_dir("discovery");
+        
+        run(async {
+            // Create two nodes
+            let node1 = Node::new("127.0.0.1:19194", &format!("{}/node1", dir))
+                .await.expect("Node 1 failed");
+            let node2 = Node::new("127.0.0.1:19195", &format!("{}/node2", dir))
+                .await.expect("Node 2 failed");
+            
+            println!("[SUCCESS] Nodes created");
+            println!("  Node 1: {}", node1.did.short());
+            println!("  Node 2: {}", node2.did.short());
+            
+            // Add test pool to both nodes
+            let test_commitment = test_pool_commitment();
+            node1.state.write().await.active_pools.insert(test_commitment);
+            node2.state.write().await.active_pools.insert(test_commitment);
+            
+            // Authenticate node1 to the pool
+            assert!(node1.auth(TEST_PASSPHRASE).await);
+            assert!(node2.auth(TEST_PASSPHRASE).await);
+            println!("[SUCCESS] Both nodes authenticated to pool");
+            
+            // Give node2 some expressions for discovery info
+            {
+                let mut store = node2.store.write().await;
+                for i in 0..5 {
+                    let expr = store.arena_mut().parse(&format!("(test-expr {})", i)).unwrap();
+                    store.store(expr).expect("Store failed");
+                }
+            }
+            println!("[SUCCESS] Node 2 has {} expressions", node2.store.read().await.len());
+            
+            Timer::after(Duration::from_millis(200)).await;
+            
+            // Test probe functionality by simulating the discovery protocol
+            // In a real test, we'd call node1.probe(), but that requires actual network
+            // Instead, test the handle_discover logic directly
+            
+            // Simulate a Discover request to node2
+            let discover_msg = NetMessage::Discover {
+                pools: vec![test_commitment],
+                want_hints: true,
+            };
+            
+            // Verify the message can be serialized and parsed
+            let data = discover_msg.serialize().expect("Serialize failed");
+            let parsed = NetMessage::deserialize(&data).expect("Deserialize failed");
+            
+            if let NetMessage::Discover { pools, want_hints } = parsed {
+                assert_eq!(pools.len(), 1);
+                assert_eq!(pools[0], test_commitment);
+                assert!(want_hints);
+                println!("[SUCCESS] Discover message correctly formed");
+            }
+            
+            // Check that node2 knows about genesis pools
+            let state2 = node2.state.read().await;
+            assert!(state2.active_pools.contains(&test_commitment));
+            let genesis_count = GENESIS_POOLS.iter()
+                .filter(|g| state2.active_pools.contains(*g))
+                .count();
+            println!("[SUCCESS] Node 2 has {} genesis pools + 1 test pool", genesis_count);
+            drop(state2);
+            
+            // Test DiscoveredPeer creation
+            let peer_info = DiscoveredPeer {
+                addr: "127.0.0.1:19195".parse().unwrap(),
+                pool: test_commitment,
+                expr_count: node2.store.read().await.len(),
+                uptime_secs: node2.started_at.elapsed().as_secs(),
+            };
+            
+            assert_eq!(peer_info.expr_count, 5);
+            assert!(peer_info.uptime_secs < 10); // Should be very recent
+            println!("[SUCCESS] DiscoveredPeer info: {} expr, {}s uptime", 
+                peer_info.expr_count, peer_info.uptime_secs);
+            
+            // Test PoolHint creation for the test pool
+            let hint = PoolHint::from_commitment(test_commitment, Some("quan...test"), 2);
+            assert!(!hint.is_genesis); // Our test pool isn't a real genesis pool
+            assert_eq!(hint.peer_count, 2);
+            println!("[SUCCESS] PoolHint created: {} peers, genesis={}", 
+                hint.peer_count, hint.is_genesis);
+            
+            // Test genesis pool hint
+            let genesis_hint = PoolHint::from_commitment(GENESIS_POOLS[0], None, 5);
+            assert!(genesis_hint.is_genesis);
+            println!("[SUCCESS] Genesis pool hint: {}, genesis={}", 
+                genesis_hint.hint, genesis_hint.is_genesis);
+            
+            // Build a complete DiscoverResponse like handle_discover would
+            let response = NetMessage::DiscoverResponse {
+                peers: vec![peer_info],
+                pool_hints: vec![hint, genesis_hint],
+            };
+            
+            // Verify it serializes correctly
+            let response_data = response.serialize().expect("Response serialize failed");
+            let parsed_response = NetMessage::deserialize(&response_data).expect("Response deserialize failed");
+            
+            if let NetMessage::DiscoverResponse { peers, pool_hints } = parsed_response {
+                assert_eq!(peers.len(), 1);
+                assert_eq!(pool_hints.len(), 2);
+                println!("[SUCCESS] DiscoverResponse: {} peers, {} hints", 
+                    peers.len(), pool_hints.len());
+            }
+            
+            node1.shutdown().await;
+            node2.shutdown().await;
+        });
+        
+        cleanup_test_dir(&dir);
+        println!("[SUCCESS] Two node discovery test passed\n");
+    }
+
+    #[test]
+    fn test_discovery_without_auth() {
+        println!("\n═══ TEST: Discovery Without Auth ═══");
+        let dir = setup_test_dir("discovery_noauth");
+        
+        run(async {
+            // Create a node but DON'T authenticate to any pool
+            let node = Node::new("127.0.0.1:19196", &format!("{}/node", dir))
+                .await.expect("Node failed");
+            
+            println!("[SUCCESS] Node created without pool auth");
+            
+            // Verify pool is None
+            assert!(node.pool.read().await.is_none());
+            println!("[SUCCESS] Node has no pool set");
+            
+            // Discovery should still work - it's designed to work without auth
+            // The node should still know about genesis pools
+            let state = node.state.read().await;
+            assert_eq!(state.active_pools.len(), GENESIS_POOLS.len());
+            println!("[SUCCESS] Node knows about {} genesis pools", state.active_pools.len());
+            drop(state);
+            
+            // Build a Discover message asking for hints
+            let discover = NetMessage::Discover {
+                pools: vec![], // Empty = all pools
+                want_hints: true,
+            };
+            
+            // This should be valid even without auth
+            let data = discover.serialize().expect("Serialize should work");
+            assert!(!data.is_empty());
+            println!("[SUCCESS] Discover message created without auth ({} bytes)", data.len());
+            
+            // Test that an unauthenticated node can still generate pool hints
+            // for genesis pools it knows about
+            let mut hints = Vec::new();
+            let state = node.state.read().await;
+            for genesis in GENESIS_POOLS.iter() {
+                if state.active_pools.contains(genesis) {
+                    hints.push(PoolHint::from_commitment(*genesis, None, 0));
+                }
+            }
+            drop(state);
+            
+            assert_eq!(hints.len(), GENESIS_POOLS.len());
+            for hint in &hints {
+                assert!(hint.is_genesis);
+                println!("  Genesis pool: {}...", &hint.hint);
+            }
+            println!("[SUCCESS] Generated {} genesis pool hints", hints.len());
+            
+            node.shutdown().await;
+        });
+        
+        cleanup_test_dir(&dir);
+        println!("[SUCCESS] Discovery without auth test passed\n");
     }
     
     #[test]

@@ -1,25 +1,97 @@
-# DIAGON v0.9.1 Alpha
+# DIAGON v0.9.2 Alpha
 
-**Security Hardened P2P Governance System for Decentralized Knowledge Transmission**
+**Security Hardened P2P Governance System with Network Discovery**
 
 *"In the struggle between truth and deception, let mathematics be the arbiter."*
 
-Core principles:
-- Homoiconicity: Code is data, data is code
-- Content-addressing: The expression IS its identity
-- Quorum sensing: Accumulate signals, threshold triggers
-- Derived state: Store expressions, compute results
-- Post-quantum: Dilithium3 signatures
-- Robust networking: Connection pooling, message framing, reconnection
-- **Security hardening: Rate limiting, replay protection, self-vote prevention**
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+   - [Core Principles](#core-principles)
+   - [What's New in v0.9.2](#whats-new-in-v092)
+   - [What's New in v0.9.1](#whats-new-in-v091-security-hardened)
+2. [Architecture](#architecture)
+   - [Identity](#identity)
+   - [Cryptographic Choices](#cryptographic-choices)
+   - [Expression Store](#expression-store)
+   - [Quorum Sensing](#quorum-sensing)
+   - [Epigenetic Marks (Trust)](#epigenetic-marks-trust)
+   - [Pools](#pools)
+3. [Network Discovery](#network-discovery)
+   - [Discovery Overview](#discovery-overview)
+   - [Discovery Messages](#discovery-messages)
+   - [Pool Hints](#pool-hints)
+   - [Discovery Flow](#discovery-flow)
+4. [Security Features](#security-features)
+   - [Rate Limiting](#rate-limiting)
+   - [Anti-Replay Protection](#anti-replay-protection)
+   - [Self-Voting Prevention](#self-voting-prevention)
+   - [Signed Protocol Messages](#signed-protocol-messages)
+   - [Expression Signature Verification](#expression-signature-verification)
+   - [DID-Pubkey Binding](#did-pubkey-binding)
+5. [Network Protocol](#network-protocol)
+   - [Connection Lifecycle](#connection-lifecycle)
+   - [Message Types](#message-types)
+   - [Framing](#framing)
+   - [Reliability](#reliability)
+6. [S-Expression Format](#s-expression-format)
+   - [Node Types](#node-types)
+   - [Signed Expressions](#signed-expressions)
+   - [Proposal Format](#proposal-format)
+   - [Vote Format](#vote-format)
+7. [Commands](#commands)
+   - [Discovery Commands](#discovery-commands)
+   - [Pool Management](#pool-management)
+   - [Peer Management](#peer-management)
+   - [Governance](#governance)
+   - [Development](#development)
+8. [Configuration Constants](#configuration-constants)
+9. [Error Types](#error-types)
+10. [Persistence](#persistence)
+11. [Usage](#usage)
+    - [Starting a Node](#starting-a-node)
+    - [Discovering the Network](#discovering-the-network)
+    - [Joining a Network](#joining-a-network)
+    - [Accepting Peers](#accepting-peers)
+    - [Creating Proposals](#creating-proposals)
+    - [Voting](#voting)
+12. [Testing](#testing)
+13. [Dependencies](#dependencies)
+14. [Genesis Pools](#genesis-pools)
+15. [Security Considerations](#security-considerations)
 
 ---
 
 ## Overview
 
+### Core Principles
+
+- **Homoiconicity**: Code is data, data is code
+- **Content-addressing**: The expression IS its identity
+- **Quorum sensing**: Accumulate signals, threshold triggers
+- **Derived state**: Store expressions, compute results
+- **Post-quantum**: Dilithium3 signatures
+- **Robust networking**: Connection pooling, message framing, reconnection
+- **Security hardening**: Rate limiting, replay protection, self-vote prevention
+- **Open discovery**: Find pools and peers without prior authentication
+
 DIAGON is a peer-to-peer governance system built on biological consensus metaphors. Nodes form authenticated mesh networks within "pools" (trust domains), propose and vote on expressions using quorum sensing, and maintain replicated expression stores with content-addressed identities.
 
 The system uses S-expressions as its fundamental data structure, enabling homoiconic representation where proposals, votes, and all protocol messages share a unified format.
+
+### What's New in v0.9.2
+
+**Network Discovery** - New users can now find their way into the network:
+
+- **`probe` command**: Query any node for available pools and known peers without authentication
+- **`crawl` command**: Recursively explore the network from a starting node
+- **`discover` command**: Ask connected peers for network topology information
+- **Pool hints**: Partial passphrase hints help users identify pools without revealing secrets
+- **Unauthenticated discovery**: Discovery protocol works before pool authentication
+- **DiscoveredPeer info**: Includes address, pool, expression count, and uptime
+- **Genesis pool identification**: Pool hints indicate which pools are genesis vs dynamic
 
 ### What's New in v0.9.1 (Security Hardened)
 
@@ -47,16 +119,13 @@ The system uses S-expressions as its fundamental data structure, enabling homoic
 
 ### Cryptographic Choices
 
-- **Dilithium3 (post-quantum)**: Used for all signatures — authentication, 
-  votes, protocol messages. Protects against "harvest now, break later" attacks.
-  
-- **SHA-256**: Used for content addressing (CIDs, Merkle roots, expression hashing). 
-  This is standard practice (used by Bitcoin, IPFS, Git). Content addressing requires 
-  collision resistance, where SHA-256 retains ~128-bit security even against quantum 
-  computers. CIDs additionally include 256 bits of cryptographic randomness, preventing 
-  collision crafting.
+| Algorithm | Purpose | Rationale |
+|-----------|---------|-----------|
+| **Dilithium3** | Signatures | Post-quantum secure, protects against "harvest now, break later" |
+| **SHA-256** | Content addressing | Standard (Bitcoin, IPFS, Git), ~128-bit quantum security |
+| **Argon2id** | Pool passphrases | Memory-hard, resists brute-force and GPU attacks |
 
-- **Argon2id**: Used for pool passphrase hashing. Memory-hard to resist brute-force.
+CIDs additionally include 256 bits of cryptographic randomness, preventing collision crafting.
 
 ### Expression Store
 
@@ -82,23 +151,166 @@ Inspired by bacterial quorum sensing, consensus emerges from accumulated signals
 
 Trust scores evolve based on participation quality:
 
-- **Default**: 0.5
-- **Update formula**: `score = score × 0.7 + effective_quality × 0.3`
-- **Verified vs unverified**: Unverified interactions capped at 0.6 quality
-- **Decay**: Score decays toward baseline when inactive
-- **Signal weight**: `max(score × 1000, 100)`
-- **Proposal threshold**: Trust ≥ 0.4 required to propose
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Default | 0.5 | Initial trust score |
+| History weight | 0.7 | Weight of existing score |
+| New weight | 0.3 | Weight of new interaction |
+| Unverified cap | 0.6 | Maximum quality for unverified interactions |
+| Minimum weight | 100 | Floor for signal weight |
+| Propose threshold | 0.4 | Minimum trust to create proposals |
+
+**Update formula**: `score = score × 0.7 + effective_quality × 0.3`
 
 ### Pools
 
 Pools are trust domains defined by shared passphrases:
 
-- **Commitment**: `Argon2id(passphrase, salt)` identifies the pool (upgraded from SHA256)
+- **Commitment**: `Argon2id(passphrase, salt)` identifies the pool
 - **Salt**: Fixed pool salt `diagon-pool-v1-salt-2024`
 - **Argon2 parameters**: Memory 64MB, Time cost 3, Parallelism 4
 - **Genesis pools**: Three hardcoded pools bootstrap the network
 - **Dynamic pools**: New pools can be proposed and voted into existence
 - **Isolation**: Nodes only connect to peers in the same pool
+- **Discoverable**: Pool hints reveal partial information for discovery
+
+---
+
+## Network Discovery
+
+### Discovery Overview
+
+Discovery allows new users to find pools and peers without prior knowledge of the network. Unlike other protocol messages, discovery works **without authentication**, enabling bootstrapping from a single known address.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    DISCOVERY FLOW                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   New User                    Known Node                        │
+│      │                            │                             │
+│      │──── probe ────────────────>│                             │
+│      │     (no auth needed)       │                             │
+│      │                            │                             │
+│      │<─── pool hints ────────────│                             │
+│      │<─── peer addresses ────────│                             │
+│      │                            │                             │
+│      │                                                          │
+│      │  [User obtains passphrase out-of-band]                   │
+│      │                                                          │
+│      │──── auth ─────────────────>│                             │
+│      │──── connect ──────────────>│                             │
+│      │──── elaborate ────────────>│                             │
+│      │<─── approve ──────────────│                             │
+│      │                            │                             │
+│      │  [Now authenticated]       │                             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Discovery Messages
+
+#### Discover Request
+
+Sent to query a node for network information:
+
+```rust
+NetMessage::Discover {
+    pools: Vec<[u8; 32]>,  // Pool commitments to filter by (empty = all)
+    want_hints: bool,       // Request pool hints for browsing
+}
+```
+
+#### Discover Response
+
+Returns known peers and pool information:
+
+```rust
+NetMessage::DiscoverResponse {
+    peers: Vec<DiscoveredPeer>,
+    pool_hints: Vec<PoolHint>,
+}
+```
+
+#### DiscoveredPeer Structure
+
+```rust
+struct DiscoveredPeer {
+    addr: SocketAddr,      // Network address
+    pool: [u8; 32],        // Pool commitment
+    expr_count: usize,     // Number of expressions stored
+    uptime_secs: u64,      // How long the node has been running
+}
+```
+
+#### PoolHint Structure
+
+```rust
+struct PoolHint {
+    commitment: [u8; 32],  // Pool identifier
+    hint: String,          // Partial passphrase (e.g., "quan...zon")
+    peer_count: usize,     // Known peers in this pool
+    is_genesis: bool,      // Whether this is a genesis pool
+}
+```
+
+### Pool Hints
+
+Pool hints provide partial information about passphrases to help users identify pools:
+
+- **Format**: First 4 and last 4 characters: `"quantum leap beyond horizon"` → `"quan...zon"`
+- **Auto-generated**: If no hint provided, uses commitment hex: `"801e100b..."`
+- **Genesis marking**: Genesis pools are clearly identified
+- **Privacy**: Hints don't reveal enough to brute-force passphrases
+
+### Discovery Flow
+
+#### Probe Sequence
+
+```
+┌──────────┐                              ┌──────────┐
+│  Prober  │                              │  Target  │
+└────┬─────┘                              └────┬─────┘
+     │                                         │
+     │  TCP Connect                            │
+     │────────────────────────────────────────>│
+     │                                         │
+     │  Discover { pools: [], want_hints: true }
+     │────────────────────────────────────────>│
+     │                                         │
+     │  DiscoverResponse { peers, pool_hints } │
+     │<────────────────────────────────────────│
+     │                                         │
+     │  TCP Close                              │
+     │────────────────────────────────────────>│
+     │                                         │
+```
+
+#### Crawl Sequence
+
+```
+┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
+│  Crawler │     │  Node A  │     │  Node B  │     │  Node C  │
+└────┬─────┘     └────┬─────┘     └────┬─────┘     └────┬─────┘
+     │                │                │                │
+     │  probe         │                │                │
+     │───────────────>│                │                │
+     │  peers: [B, C] │                │                │
+     │<───────────────│                │                │
+     │                │                │                │
+     │  probe                          │                │
+     │────────────────────────────────>│                │
+     │  peers: [A, C, D]               │                │
+     │<────────────────────────────────│                │
+     │                │                │                │
+     │  probe                                           │
+     │─────────────────────────────────────────────────>│
+     │  peers: [A, B]                                   │
+     │<─────────────────────────────────────────────────│
+     │                │                │                │
+     │  [Continue until max_hops or all visited]       │
+     │                │                │                │
+```
 
 ---
 
@@ -145,10 +357,32 @@ Critical protocol messages now require cryptographic signatures:
 
 Signed expressions are verified before storage:
 
-1. Parse expression to extract `(signed pubkey signature inner)`
-2. Serialize inner expression
-3. Verify signature against pubkey using Dilithium3
-4. Only store if verification succeeds
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              EXPRESSION VERIFICATION FLOW                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   1. Receive expression data                                    │
+│                    │                                            │
+│                    ▼                                            │
+│   2. Parse: (signed #x<pubkey> #x<signature> <inner>)          │
+│                    │                                            │
+│                    ▼                                            │
+│   3. Serialize inner expression                                 │
+│                    │                                            │
+│                    ▼                                            │
+│   4. Verify: Dilithium3.verify(signature, inner, pubkey)       │
+│                    │                                            │
+│           ┌───────┴───────┐                                     │
+│           ▼               ▼                                     │
+│       [Valid]         [Invalid]                                 │
+│           │               │                                     │
+│           ▼               ▼                                     │
+│     Store expr       Reject with                                │
+│                      Crypto error                               │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ### DID-Pubkey Binding
 
@@ -164,31 +398,68 @@ During Hello exchange, DIDs are verified to match public keys:
 
 ### Connection Lifecycle
 
-1. **TCP Connect**: Initiator connects to receiver
-2. **Hello Exchange**: Both sides send `Hello { did, pubkey, pool, expr_root }`
-3. **DID Verification**: Verify DID matches pubkey
-4. **Challenge-Response**: Cryptographic verification via signed nonces (10s timeout)
-5. **Elaboration (HITL)**: Initiator must provide signed human-written elaboration (≥20 chars)
-6. **Approval/Rejection**: Receiver manually approves (with signed timestamp) or rejects
-7. **Authenticated**: Connection enters full mesh participation
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              AUTHENTICATED CONNECTION SEQUENCE                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   Initiator                              Receiver               │
+│       │                                      │                  │
+│       │──── TCP Connect ────────────────────>│                  │
+│       │                                      │                  │
+│       │──── Hello { did, pubkey, pool } ────>│                  │
+│       │                                      │                  │
+│       │<─── Hello { did, pubkey, pool } ─────│                  │
+│       │                                      │                  │
+│       │     [DID-Pubkey verification]        │                  │
+│       │     [Pool matching]                  │                  │
+│       │                                      │                  │
+│       │<─── Challenge(nonce) ────────────────│                  │
+│       │                                      │                  │
+│       │──── Response(nonce, sig) ───────────>│                  │
+│       │                                      │                  │
+│       │     [Signature verification]         │                  │
+│       │     [10 second timeout]              │                  │
+│       │                                      │                  │
+│       │<─── ElaborateRequest ────────────────│                  │
+│       │                                      │                  │
+│       │──── Elaborate { text, sig } ────────>│                  │
+│       │                                      │                  │
+│       │     [Human reviews elaboration]      │                  │
+│       │                                      │                  │
+│       │<─── Approve { ts, did, sig } ────────│                  │
+│       │         or                           │                  │
+│       │<─── Reject { reason, sig } ──────────│                  │
+│       │                                      │                  │
+│       │     [If approved: AUTHENTICATED]     │                  │
+│       │                                      │                  │
+│       │<─── SyncRequest ─────────────────────│                  │
+│       │──── SyncReply ──────────────────────>│                  │
+│       │                                      │                  │
+│       │     [Full mesh participation]        │                  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ### Message Types
 
-| Message | Direction | Purpose |
-|---------|-----------|---------|
-| `Hello` | Bidirectional | Identity and pool announcement |
-| `Challenge` | Receiver → Initiator | 32-byte nonce for signature |
-| `Response` | Initiator → Receiver | Signed nonce proof |
-| `ElaborateRequest` | Receiver → Initiator | Request human elaboration |
-| `Elaborate` | Initiator → Receiver | Signed elaboration text |
-| `Approve` | Receiver → Initiator | Signed acceptance with timestamp and peer DID |
-| `Reject` | Receiver → Initiator | Signed denial with reason |
-| `Expression` | Broadcast | New S-expression to replicate (verified) |
-| `Signal` | Broadcast | Signed quorum vote signal |
-| `SyncRequest` | Any → Any | Request missing expressions |
-| `SyncReply` | Any → Any | Batch of expressions (verified) |
-| `Heartbeat` | Broadcast | Signed keep-alive with timestamp (30s interval) |
-| `Disconnect` | Any → Any | Signed graceful shutdown with timestamp |
+| Message | Direction | Auth Required | Purpose |
+|---------|-----------|---------------|---------|
+| `Discover` | Any → Any | **No** | Query for peers and pool hints |
+| `DiscoverResponse` | Any → Any | **No** | Return network information |
+| `Hello` | Bidirectional | No | Identity and pool announcement |
+| `Challenge` | Receiver → Initiator | No | 32-byte nonce for signature |
+| `Response` | Initiator → Receiver | No | Signed nonce proof |
+| `ElaborateRequest` | Receiver → Initiator | No | Request human elaboration |
+| `Elaborate` | Initiator → Receiver | No | Signed elaboration text |
+| `Approve` | Receiver → Initiator | No | Signed acceptance |
+| `Reject` | Receiver → Initiator | No | Signed denial |
+| `Expression` | Broadcast | **Yes** | New S-expression (verified) |
+| `Signal` | Broadcast | **Yes** | Signed quorum vote |
+| `SyncRequest` | Any → Any | **Yes** | Request missing expressions |
+| `SyncReply` | Any → Any | **Yes** | Batch of expressions |
+| `Heartbeat` | Broadcast | **Yes** | Signed keep-alive |
+| `Disconnect` | Any → Any | **Yes** | Signed graceful shutdown |
 
 ### Framing
 
@@ -199,18 +470,22 @@ All messages are length-prefixed:
 
 ### Reliability
 
-- **Connection pool**: Maximum 100 concurrent connections
-- **Automatic reconnection**: Up to 10 attempts with 5s intervals
-- **Peer timeout**: 150 seconds of inactivity triggers disconnect
-- **Challenge timeout**: 10 seconds to complete authentication (reduced from 30s)
-- **Heartbeat**: 30-second interval keeps connections alive (now signed)
-- **Sync**: 60-second interval reconciles expression stores (limited to 100 expressions per reply)
+| Feature | Value | Description |
+|---------|-------|-------------|
+| Connection pool | 100 | Maximum concurrent connections |
+| Reconnect attempts | 10 | With 5s intervals |
+| Peer timeout | 150s | Inactivity triggers disconnect |
+| Challenge timeout | 10s | Auth challenge expiry |
+| Heartbeat interval | 30s | Keep-alive frequency |
+| Sync interval | 60s | Expression reconciliation |
+| Sync batch limit | 100 | Expressions per SyncReply |
 
 ---
 
 ## S-Expression Format
 
 ### Node Types
+
 ```
 Nil     → ()
 Atom    → symbol
@@ -222,6 +497,7 @@ Cons    → (car . cdr)
 ### Signed Expressions
 
 All proposals and votes are wrapped in signed envelopes:
+
 ```lisp
 (signed
   #x<pubkey>
@@ -232,12 +508,14 @@ All proposals and votes are wrapped in signed envelopes:
 The signature covers the serialized inner expression and is verified using Dilithium3.
 
 ### Proposal Format
+
 ```lisp
 (signed #x<pubkey> #x<sig>
   (propose "proposal text" "elaboration"))
 ```
 
 ### Vote Format
+
 ```lisp
 (signed #x<pubkey> #x<sig>
   (vote #x<target-cid> yes|no "elaboration"))
@@ -247,34 +525,46 @@ The signature covers the serialized inner expression and is verified using Dilit
 
 ## Commands
 
+### Discovery Commands
+
+```
+probe <addr>                   Query any node for peers/pools (no auth needed)
+crawl <addr> <hops>            Recursively explore network (default 5 hops)
+discover                       Ask connected peers for network info
+```
+
 ### Pool Management
+
 ```
 auth <passphrase>              Authenticate to a pool (Argon2 hashed)
 list-pools                     Show active and pending pools
 propose-pool <phrase> - <rationale>   Propose new pool
-vote-pool <id> <y/n> <elaboration>    Vote on pool proposal (cannot self-vote)
+vote-pool <id> <y/n> <elaboration>    Vote on pool proposal
 ```
 
 ### Peer Management
+
 ```
 connect <host:port>            Initiate connection to peer
 elaborate <text>               Send signed elaboration (min 20 chars)
-approve <id>                   Approve pending peer (by DID prefix or address)
+approve <id>                   Approve pending peer
 reject <id> <reason>           Reject pending peer
 ```
 
 ### Governance
+
 ```
 propose <text>                 Create new proposal (requires trust ≥ 0.4)
-vote <cid> <y/n> <elaboration> Vote on proposal (cannot self-vote, min 20 char elaboration)
+vote <cid> <y/n> <elaboration> Vote on proposal (min 20 char elaboration)
 status                         Show node status, proposals, connections
 ```
 
 ### Development
+
 ```
 eval <sexp>                    Parse and store S-expression
 help                           Show command list
-quit                           Graceful shutdown (sends signed disconnect)
+quit                           Graceful shutdown
 ```
 
 ---
@@ -288,7 +578,7 @@ quit                           Graceful shutdown (sends signed disconnect)
 | `HEARTBEAT_INTERVAL` | 30s | Keep-alive frequency |
 | `SYNC_INTERVAL` | 60s | Expression sync frequency |
 | `PEER_TIMEOUT_SECS` | 150s | Inactivity disconnect |
-| `CHALLENGE_TIMEOUT_SECS` | **10s** | Auth challenge expiry (reduced) |
+| `CHALLENGE_TIMEOUT_SECS` | 10s | Auth challenge expiry |
 | `MIN_ELABORATION_LEN` | 20 | Minimum elaboration characters |
 | `MAX_MESSAGE_SIZE` | 1 MB | Maximum network message |
 | `MAX_CONNECTIONS` | 100 | Connection pool limit |
@@ -311,7 +601,7 @@ quit                           Graceful shutdown (sends signed disconnect)
 |-------|-------------|
 | `Io` | I/O operation failed |
 | `Serialization` | Message serialization/deserialization failed |
-| `Crypto` | Cryptographic operation failed (invalid key, signature verification) |
+| `Crypto` | Cryptographic operation failed |
 | `Validation` | Protocol validation failed |
 | `InsufficientTrust` | Trust score too low for operation |
 | `RateLimited` | Peer exceeded message rate limit |
@@ -319,10 +609,10 @@ quit                           Graceful shutdown (sends signed disconnect)
 | `MessageTooLarge` | Message exceeds 1 MB limit |
 | `PoolFull` | Connection pool at capacity |
 | `ChannelClosed` | Internal communication channel closed |
-| `StoreFull` | Expression store at capacity (100,000) |
+| `StoreFull` | Expression store at capacity |
 | `ReplayAttack` | Replayed nonce detected |
 | `SelfVoteProhibited` | Cannot vote on own proposal |
-| `SignatureRequired` | Valid signature required but missing/invalid |
+| `SignatureRequired` | Valid signature required but missing |
 
 ---
 
@@ -341,6 +631,7 @@ State is persisted to `<db_path>/state.cbor` using atomic writes:
 ## Usage
 
 ### Starting a Node
+
 ```bash
 # Default: 127.0.0.1:9070, database in ./diagon_db
 cargo run
@@ -349,33 +640,92 @@ cargo run
 cargo run -- 192.168.1.10:9070 /var/lib/diagon
 ```
 
-### Joining a Network
+### Discovering the Network
+
+New users can discover the network knowing only a single address:
+
 ```bash
-> auth quantum leap beyond horizon    # Authenticate to genesis pool (Argon2 hashed)
-> connect 192.168.1.20:9070           # Connect to peer
+$ cargo run
+
+> probe 192.168.1.10:9070
+[PROBE] Connecting to 192.168.1.10:9070 for discovery...
+[PROBE] Available pools:
+  801e... "quan...zon" 5 peers [genesis]
+  93a7... "shar...ret" 3 peers [genesis]
+  c78d... "deep...ink" 2 peers [genesis]
+[PROBE] Known peers:
+  192.168.1.10:9070 in pool 801e... (1523 expr)
+  192.168.1.20:9070 in pool 801e... (892 expr)
+  192.168.1.30:9070 in pool 801e... (445 expr)
+```
+
+Crawl the network to find all reachable nodes:
+
+```bash
+> crawl 192.168.1.10:9070 10
+[CRAWL] Starting network crawl from 192.168.1.10:9070...
+[CRAWL] Probing 192.168.1.10:9070 (hop 1)... found 3 peers, 3 pools
+[CRAWL] Probing 192.168.1.20:9070 (hop 2)... found 4 peers, 3 pools
+[CRAWL] Probing 192.168.1.30:9070 (hop 3)... found 2 peers, 3 pools
+
+[CRAWL] === Summary ===
+[CRAWL] Visited 3 nodes
+[CRAWL] Found 5 unique peers
+[CRAWL] Found 3 pools
+
+[CRAWL] Pools:
+  801e... "quan...zon" [genesis]
+  93a7... "shar...ret" [genesis]
+  c78d... "deep...ink" [genesis]
+```
+
+### Joining a Network
+
+Once you have the passphrase (obtained out-of-band from existing participants):
+
+```bash
+> auth quantum leap beyond horizon
+[OK] Pool authenticated: 801e100b...
+
+> connect 192.168.1.10:9070
+[->] Connecting to 192.168.1.10:9070
+
 # Wait for elaboration request...
-> elaborate I am joining this network to participate in distributed governance experiments.
-# Wait for signed approval from peer...
+> elaborate I discovered this network through probing and want to participate in governance.
+[->] Elaboration sent
+
+# Wait for approval from peer...
+[OK] Authenticated with 192.168.1.10:9070
+
+# Ask authenticated peers for more network info
+> discover
+[DISCOVER] Asking 1 peer(s) for network info...
+[DISCOVER] Received 2 peer(s) from 192.168.1.10:9070:
+  192.168.1.20:9070 (pool: 801e..., 892 expr) [same-pool]
+  192.168.1.30:9070 (pool: 801e..., 445 expr) [same-pool]
 ```
 
 ### Accepting Peers
+
 ```bash
-# When a peer connects and elaborates, you'll see:
+# When a peer connects and elaborates:
 # 🔔 ELABORATION from abc123...
 #    "Their elaboration text here"
 
-> approve abc123                      # Approve by DID prefix (sends signed approval)
+> approve abc123                      # Approve by DID prefix
 # or
 > reject abc123 Insufficient elaboration
 ```
 
 ### Creating Proposals
+
 ```bash
 > propose Implement zero-knowledge proof verification for private voting.
 # [PROPOSE] 7f3a2b1c
 ```
 
 ### Voting
+
 ```bash
 > vote 7f3a y This is essential for privacy-preserving governance systems.
 # [VOTE] YES on 7f3a2b1c
@@ -385,21 +735,25 @@ cargo run -- 192.168.1.10:9070 /var/lib/diagon
 ---
 
 ## Testing
+
 ```bash
 # Run all tests (single-threaded for network tests)
 cargo test -- --nocapture --test-threads=1
 
-# Key security tests
+# Discovery tests (v0.9.2)
+cargo test test_pool_hints
+cargo test test_discovery_messages
+cargo test test_two_node_discovery
+cargo test test_discovery_without_auth
+
+# Security tests (v0.9.1)
 cargo test test_self_voting_prevention
 cargo test test_rate_limiter
 cargo test test_nonce_tracker
 cargo test test_pool_hash_argon2
-cargo test test_did_generation           # Includes DID-pubkey matching
+cargo test test_did_generation
 cargo test test_elaboration_scoring
 cargo test test_expression_store_limits
-cargo test test_derived_state_limits
-cargo test test_message_signable_bytes
-cargo test test_quorum_signal_signable_bytes
 
 # Integration tests
 cargo test test_three_node_mesh_async
@@ -411,28 +765,31 @@ cargo test test_persistence
 
 ## Dependencies
 
-- `sha2`: SHA-256 hashing
-- `pqcrypto-dilithium`: Post-quantum Dilithium3 signatures
-- `serde`, `bincode`, `serde_cbor`: Serialization
-- `rand`: Cryptographic randomness
-- `argon2`: Argon2id password hashing for pool authentication
-- `smol`: Async runtime
-- `async-channel`, `async-lock`: Async primitives
-- `futures-lite`: Async utilities
-- `hex`: Hex encoding/decoding
+| Crate | Purpose |
+|-------|---------|
+| `sha2` | SHA-256 hashing |
+| `pqcrypto-dilithium` | Post-quantum Dilithium3 signatures |
+| `serde`, `bincode`, `serde_cbor` | Serialization |
+| `rand` | Cryptographic randomness |
+| `argon2` | Argon2id password hashing |
+| `smol` | Async runtime |
+| `async-channel`, `async-lock` | Async primitives |
+| `futures-lite` | Async utilities |
+| `hex` | Hex encoding/decoding |
 
 ---
 
 ## Genesis Pools
 
 Three pools are active at genesis (commitments shown):
+
 ```
 #1 801e100b... [genesis]
 #2 93a780b1... [genesis]
 #3 c78dec83... [genesis]
 ```
 
-**Note**: Genesis pool commitments are based on the legacy SHA256 hashing. New pools use Argon2id. Contact existing network participants to obtain genesis passphrases.
+**Note**: Genesis pool commitments are based on legacy SHA256 hashing. New pools use Argon2id. Use `probe` to discover pools and contact existing participants to obtain passphrases.
 
 ---
 
@@ -440,17 +797,28 @@ Three pools are active at genesis (commitments shown):
 
 ### Threat Model
 
-DIAGON v0.9.1 addresses the following threats:
+DIAGON v0.9.2 addresses the following threats:
 
-1. **DoS via message flooding**: Mitigated by per-peer rate limiting
-2. **Replay attacks**: Mitigated by nonce tracking with time-bounded windows
-3. **Sybil voting**: Mitigated by human-in-the-loop elaboration and approval
-4. **Self-voting inflation**: Mitigated by explicit self-vote prohibition
-5. **Unsigned message injection**: Mitigated by requiring signatures on critical messages
-6. **Memory exhaustion**: Mitigated by store size limits
-7. **DID spoofing**: Mitigated by DID-pubkey binding verification
-8. **Expression forgery**: Mitigated by signature verification before storage
-9. **Brute-force pool discovery**: Mitigated by Argon2 (memory-hard hashing)
+| Threat | Mitigation |
+|--------|------------|
+| DoS via message flooding | Per-peer rate limiting |
+| Replay attacks | Nonce tracking with time-bounded windows |
+| Sybil voting | Human-in-the-loop elaboration and approval |
+| Self-voting inflation | Explicit self-vote prohibition |
+| Unsigned message injection | Signatures required on critical messages |
+| Memory exhaustion | Store size limits |
+| DID spoofing | DID-pubkey binding verification |
+| Expression forgery | Signature verification before storage |
+| Brute-force pool discovery | Argon2 (memory-hard hashing) |
+| Network enumeration | Intentionally allowed for bootstrapping |
+
+### Discovery Security Notes
+
+1. **Discovery reveals pool commitments** - By design, so users can find pools
+2. **Pool hints are partial** - `"quan...zon"` doesn't reveal full passphrase
+3. **No consensus state leaked** - Only peer addresses and existence
+4. **Rate limiting applies** - Probe connections are short-lived
+5. **No auth bypass** - Discovery shows addresses only; still need passphrase + elaboration + approval
 
 ### Remaining Considerations
 
@@ -458,5 +826,4 @@ DIAGON v0.9.1 addresses the following threats:
 - **Long-range attacks**: Trust decay helps but doesn't fully prevent
 - **Collusion**: Quorum threshold (67%) requires significant coordination
 - **Key compromise**: No key rotation mechanism yet
-
----
+- **Network topology leakage**: Crawling reveals network structure (intentional for bootstrapping)
