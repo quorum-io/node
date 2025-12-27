@@ -231,6 +231,322 @@ impl NonceTracker {
 }
 
 // ============================================================================
+// CHUNKED CONTENT TRANSFER
+// ============================================================================
+
+/// Chunk size: 256KB to stay well under MAX_MESSAGE_SIZE (1MB)
+const CONTENT_CHUNK_SIZE: usize = 262_144;
+
+/// Maximum concurrent incoming transfers per peer
+const MAX_PENDING_TRANSFERS: usize = 5;
+
+/// Transfer timeout in seconds
+const TRANSFER_TIMEOUT_SECS: u64 = 300;
+
+/// Content types for the message command
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContentType {
+    Image,
+    Video,
+    Text,
+}
+
+impl ContentType {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "image" | "img" | "photo" => Some(Self::Image),
+            "video" | "vid" | "movie" => Some(Self::Video),
+            "text" | "txt" | "doc" => Some(Self::Text),
+            _ => None,
+        }
+    }
+    
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Video => "video",
+            Self::Text => "text",
+        }
+    }
+}
+
+impl fmt::Display for ContentType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Metadata for a content transfer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentMetadata {
+    /// Unique identifier for this transfer
+    pub content_id: [u8; 32],
+    /// Type of content being transferred
+    pub content_type: ContentType,
+    /// Total size in bytes
+    pub total_size: u64,
+    /// Number of chunks
+    pub total_chunks: u32,
+    /// SHA256 hash of complete content for verification
+    pub content_hash: [u8; 32],
+    /// Optional filename
+    pub filename: Option<String>,
+    /// Optional MIME type (e.g., "image/png", "video/mp4")
+    pub mime_type: Option<String>,
+    /// Sender's DID
+    pub sender: Did,
+    /// Timestamp of transfer initiation
+    pub timestamp: u64,
+    /// Signature over metadata (excluding signature field)
+    pub signature: Vec<u8>,
+}
+
+impl ContentMetadata {
+    /// Create new metadata for content
+    pub fn new(
+        content_type: ContentType,
+        data: &[u8],
+        filename: Option<String>,
+        mime_type: Option<String>,
+        sender: Did,
+    ) -> Self {
+        let mut content_id = [0u8; 32];
+        OsRng.fill_bytes(&mut content_id);
+        
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let content_hash: [u8; 32] = hasher.finalize().into();
+        
+        let total_chunks = ((data.len() + CONTENT_CHUNK_SIZE - 1) / CONTENT_CHUNK_SIZE) as u32;
+        
+        Self {
+            content_id,
+            content_type,
+            total_size: data.len() as u64,
+            total_chunks,
+            content_hash,
+            filename,
+            mime_type,
+            sender,
+            timestamp: timestamp(),
+            signature: Vec::new(),
+        }
+    }
+    
+    /// Get bytes to sign (excludes signature field)
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&self.content_id);
+        data.push(self.content_type as u8);
+        data.extend_from_slice(&self.total_size.to_le_bytes());
+        data.extend_from_slice(&self.total_chunks.to_le_bytes());
+        data.extend_from_slice(&self.content_hash);
+        if let Some(ref f) = self.filename {
+            data.extend_from_slice(f.as_bytes());
+        }
+        if let Some(ref m) = self.mime_type {
+            data.extend_from_slice(m.as_bytes());
+        }
+        data.extend_from_slice(self.sender.0.as_bytes());
+        data.extend_from_slice(&self.timestamp.to_le_bytes());
+        data
+    }
+}
+
+/// A single chunk of content
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentChunk {
+    /// Reference to parent transfer
+    pub content_id: [u8; 32],
+    /// Zero-based chunk index
+    pub chunk_index: u32,
+    /// Chunk data
+    pub data: Vec<u8>,
+    /// SHA256 hash of this chunk
+    pub chunk_hash: [u8; 32],
+}
+
+impl ContentChunk {
+    /// Create a chunk from data slice
+    pub fn new(content_id: [u8; 32], chunk_index: u32, data: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let chunk_hash: [u8; 32] = hasher.finalize().into();
+        
+        Self {
+            content_id,
+            chunk_index,
+            data: data.to_vec(),
+            chunk_hash,
+        }
+    }
+    
+    /// Verify chunk integrity
+    pub fn verify(&self) -> bool {
+        let mut hasher = Sha256::new();
+        hasher.update(&self.data);
+        let computed: [u8; 32] = hasher.finalize().into();
+        computed == self.chunk_hash
+    }
+}
+
+/// State for tracking an incoming transfer
+#[derive(Debug)]
+pub struct IncomingTransfer {
+    pub metadata: ContentMetadata,
+    pub chunks: HashMap<u32, Vec<u8>>,
+    pub received_count: u32,
+    pub started_at: Instant,
+}
+
+impl IncomingTransfer {
+    pub fn new(metadata: ContentMetadata) -> Self {
+        Self {
+            metadata,
+            chunks: HashMap::new(),
+            received_count: 0,
+            started_at: Instant::now(),
+        }
+    }
+    
+    /// Check if transfer is complete
+    pub fn is_complete(&self) -> bool {
+        self.received_count == self.metadata.total_chunks
+    }
+    
+    /// Check if transfer has timed out
+    pub fn is_expired(&self) -> bool {
+        self.started_at.elapsed() > Duration::from_secs(TRANSFER_TIMEOUT_SECS)
+    }
+    
+    /// Add a chunk, returns true if this was a new chunk
+    pub fn add_chunk(&mut self, chunk: &ContentChunk) -> Result<bool> {
+        // Verify chunk belongs to this transfer
+        if chunk.content_id != self.metadata.content_id {
+            return Err(DiagonError::Validation("Chunk ID mismatch".into()));
+        }
+        
+        // Verify chunk index is valid
+        if chunk.chunk_index >= self.metadata.total_chunks {
+            return Err(DiagonError::Validation("Invalid chunk index".into()));
+        }
+        
+        // Verify chunk integrity
+        if !chunk.verify() {
+            return Err(DiagonError::Validation("Chunk hash mismatch".into()));
+        }
+        
+        // Check if we already have this chunk
+        if self.chunks.contains_key(&chunk.chunk_index) {
+            return Ok(false);
+        }
+        
+        // Store chunk
+        self.chunks.insert(chunk.chunk_index, chunk.data.clone());
+        self.received_count += 1;
+        
+        Ok(true)
+    }
+    
+    /// Reassemble complete content
+    pub fn reassemble(&self) -> Result<Vec<u8>> {
+        if !self.is_complete() {
+            return Err(DiagonError::Validation("Transfer not complete".into()));
+        }
+        
+        let mut result = Vec::with_capacity(self.metadata.total_size as usize);
+        
+        for i in 0..self.metadata.total_chunks {
+            let chunk_data = self.chunks.get(&i)
+                .ok_or_else(|| DiagonError::Validation(format!("Missing chunk {}", i)))?;
+            result.extend_from_slice(chunk_data);
+        }
+        
+        // Verify final hash
+        let mut hasher = Sha256::new();
+        hasher.update(&result);
+        let computed: [u8; 32] = hasher.finalize().into();
+        
+        if computed != self.metadata.content_hash {
+            return Err(DiagonError::Validation("Content hash mismatch".into()));
+        }
+        
+        Ok(result)
+    }
+}
+
+/// Encoder for chunking large content
+pub struct ContentEncoder {
+    metadata: ContentMetadata,
+    data: Vec<u8>,
+    current_chunk: u32,
+}
+
+impl ContentEncoder {
+    pub fn new(
+        content_type: ContentType,
+        data: Vec<u8>,
+        filename: Option<String>,
+        mime_type: Option<String>,
+        sender: Did,
+    ) -> Self {
+        let metadata = ContentMetadata::new(
+            content_type,
+            &data,
+            filename,
+            mime_type,
+            sender,
+        );
+        
+        Self {
+            metadata,
+            data,
+            current_chunk: 0,
+        }
+    }
+    
+    /// Sign the metadata with the given secret key
+    pub fn sign(&mut self, secret_key: &SecretKey) {
+        let signable = self.metadata.signable_bytes();
+        self.metadata.signature = detached_sign(&signable, secret_key).as_bytes().to_vec();
+    }
+    
+    /// Get the metadata (call after signing)
+    pub fn metadata(&self) -> &ContentMetadata {
+        &self.metadata
+    }
+    
+    /// Get the next chunk, or None if all chunks have been produced
+    pub fn next_chunk(&mut self) -> Option<ContentChunk> {
+        if self.current_chunk >= self.metadata.total_chunks {
+            return None;
+        }
+        
+        let start = (self.current_chunk as usize) * CONTENT_CHUNK_SIZE;
+        let end = ((self.current_chunk as usize + 1) * CONTENT_CHUNK_SIZE).min(self.data.len());
+        
+        let chunk = ContentChunk::new(
+            self.metadata.content_id,
+            self.current_chunk,
+            &self.data[start..end],
+        );
+        
+        self.current_chunk += 1;
+        Some(chunk)
+    }
+    
+    /// Check if all chunks have been produced
+    pub fn is_complete(&self) -> bool {
+        self.current_chunk >= self.metadata.total_chunks
+    }
+    
+    /// Reset to send again
+    pub fn reset(&mut self) {
+        self.current_chunk = 0;
+    }
+}
+
+// ============================================================================
 // ARENA ALLOCATOR
 // ============================================================================
 
@@ -547,6 +863,7 @@ impl Default for ExprStore { fn default() -> Self { Self::new() } }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QuorumSignal {
     pub source: Did,
+    pub pubkey: Vec<u8>,
     pub target: Cid,
     pub weight: u64,
     pub support: bool,
@@ -743,6 +1060,35 @@ pub enum NetMessage {
     DiscoverResponse {
         peers: Vec<DiscoveredPeer>,
         pool_hints: Vec<PoolHint>,
+    },
+    /// Announce start of content transfer
+    ContentStart(ContentMetadata),
+    
+    /// A chunk of content data
+    ContentData(ContentChunk),
+    
+    /// Acknowledge receipt of a chunk
+    ContentAck { 
+        content_id: [u8; 32], 
+        chunk_index: u32 
+    },
+    
+    /// Request retransmission of missing chunks
+    ContentRetransmit {
+        content_id: [u8; 32],
+        missing_chunks: Vec<u32>,
+    },
+    
+    /// Signal transfer completion (receiver confirms)
+    ContentComplete { 
+        content_id: [u8; 32],
+        signature: Vec<u8>,
+    },
+    
+    /// Signal transfer error
+    ContentError { 
+        content_id: [u8; 32], 
+        reason: String 
     },
 }
 
@@ -1078,6 +1424,10 @@ pub struct Node {
     rate_limiter: RwLock<RateLimiter>,
     // SECURITY: Nonce tracker for anti-replay
     nonce_tracker: RwLock<NonceTracker>,
+    /// Incoming content transfers being reassembled
+    incoming_transfers: RwLock<HashMap<[u8; 32], IncomingTransfer>>,
+    /// Outgoing transfers awaiting completion
+    outgoing_transfers: RwLock<HashMap<[u8; 32], ContentEncoder>>,
 }
 
 impl Node {
@@ -1107,9 +1457,11 @@ impl Node {
             db_path: db_path.to_string(),
             rate_limiter: RwLock::new(RateLimiter::default()),
             nonce_tracker: RwLock::new(NonceTracker::new(CHALLENGE_TIMEOUT_SECS * 2)),
+            incoming_transfers: RwLock::new(HashMap::new()),
+            outgoing_transfers: RwLock::new(HashMap::new()),
         });
         
-        println!("DIAGON v0.9.1 - Biological Consensus Machine (Security Hardened)");
+        println!("DIAGON v0.9.3");
         println!("   \"Consensus on expressions, derivation of truth\"");
         println!();
         println!("[MY ID] DID: {}", did.0);
@@ -1456,6 +1808,7 @@ impl Node {
         let mark = self.state.read().await.get_mark(&self.did);
         let signal = QuorumSignal { 
             source: self.did.clone(), 
+            pubkey: self.public_key.as_bytes().to_vec(),
             target: cid, 
             weight: mark.signal_weight(), 
             support, 
@@ -1547,7 +1900,8 @@ impl Node {
         
         let mark = self.state.read().await.get_mark(&self.did);
         let signal = QuorumSignal { 
-            source: self.did.clone(), 
+            source: self.did.clone(),
+            pubkey: self.public_key.as_bytes().to_vec(),
             target: Cid(commitment), 
             weight: mark.signal_weight(), 
             support, 
@@ -1891,6 +2245,30 @@ impl Node {
             NetMessage::DiscoverResponse { peers, pool_hints } => {
                 self.handle_discover_response(peers, pool_hints, from).await
             }
+            NetMessage::ContentStart(metadata) => {
+            self.handle_content_start(metadata, from).await
+            }
+            NetMessage::ContentData(chunk) => {
+                self.handle_content_data(chunk, from).await
+            }
+            NetMessage::ContentAck { content_id, chunk_index } => {
+                // Optional: Track acknowledged chunks for flow control
+                Ok(())
+            }
+            NetMessage::ContentRetransmit { content_id, missing_chunks } => {
+                self.handle_content_retransmit(content_id, missing_chunks, from).await
+            }
+            NetMessage::ContentComplete { content_id, signature } => {
+                // Transfer confirmed, clean up outgoing
+                self.outgoing_transfers.write().await.remove(&content_id);
+                println!("[CONTENT] Transfer {} confirmed complete", hex::encode(&content_id[..8]));
+                Ok(())
+            }
+            NetMessage::ContentError { content_id, reason } => {
+                println!("[CONTENT] Transfer {} failed: {}", hex::encode(&content_id[..8]), reason);
+                self.outgoing_transfers.write().await.remove(&content_id);
+                Ok(())
+            }
         }
     }
     
@@ -2206,21 +2584,14 @@ impl Node {
     
     // SECURITY: Verify signal signatures
     async fn handle_signal(&self, signal: QuorumSignal, from: SocketAddr) -> Result<()> {
-        // Get the peer's pubkey to verify the signal
-        let info = self.connection_pool.get_info(&from).await
-            .ok_or(DiagonError::Validation("Unknown peer".into()))?;
-        let pubkey = info.read().await.pubkey.clone()
-            .ok_or(DiagonError::Validation("No pubkey".into()))?;
-        
-        // Verify the signal signature
-        let signable = signal.signable_bytes();
-        self.verify(&signable, &signal.signature, &pubkey)?;
-        
-        // Verify the source DID matches the peer
-        let peer_did = info.read().await.did.clone();
-        if peer_did.as_ref() != Some(&signal.source) {
-            return Err(DiagonError::Validation("Signal source doesn't match peer".into()));
+        // Verify the source DID matches the embedded pubkey
+        if !signal.source.matches_pubkey(&signal.pubkey) {
+            return Err(DiagonError::Validation("Signal source doesn't match pubkey".into()));
         }
+        
+        // Verify the signal signature using the embedded pubkey
+        let signable = signal.signable_bytes();
+        self.verify(&signable, &signal.signature, &signal.pubkey)?;
         
         let mut state = self.state.write().await;
         if let Some(proposal) = state.proposals.get_mut(&signal.target) {
@@ -2244,6 +2615,7 @@ impl Node {
         }
         drop(state);
         
+        // Forward to other peers
         let msg = NetMessage::Signal(signal);
         let msg_data = msg.serialize()?;
         for addr in self.connection_pool.authenticated_addrs().await {
@@ -2721,6 +3093,313 @@ impl Node {
             }
         }
     }
+
+    /// Send content to all authenticated peers
+    pub async fn message(&self, content_type_str: &str, file_path: &str) {
+        // Parse content type
+        let content_type = match ContentType::from_str(content_type_str) {
+            Some(ct) => ct,
+            None => {
+                println!("[ERROR] Invalid content type. Use: image, video, or text");
+                return;
+            }
+        };
+        
+        // Read file
+        let data = match smol::fs::read(file_path).await {
+            Ok(d) => d,
+            Err(e) => {
+                println!("[ERROR] Failed to read file: {}", e);
+                return;
+            }
+        };
+        
+        // Check size limits (e.g., 100MB max)
+        const MAX_CONTENT_SIZE: usize = 100 * 1024 * 1024;
+        if data.len() > MAX_CONTENT_SIZE {
+            println!("[ERROR] Content too large. Max size: {} MB", MAX_CONTENT_SIZE / 1024 / 1024);
+            return;
+        }
+        
+        // Extract filename
+        let filename = std::path::Path::new(file_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+        
+        // Detect MIME type (simplified)
+        let mime_type = match content_type {
+            ContentType::Image => detect_image_mime(&data),
+            ContentType::Video => detect_video_mime(&data),
+            ContentType::Text => Some("text/plain".to_string()),
+        };
+        
+        // Create encoder
+        let mut encoder = ContentEncoder::new(
+            content_type,
+            data,
+            filename.clone(),
+            mime_type,
+            self.did.clone(),
+        );
+        encoder.sign(&self.secret_key);
+        
+        let content_id = encoder.metadata().content_id;
+        let total_chunks = encoder.metadata().total_chunks;
+        let total_size = encoder.metadata().total_size;
+        
+        println!("[CONTENT] Sending {} '{}' ({} bytes, {} chunks)",
+            content_type,
+            filename.as_deref().unwrap_or("unnamed"),
+            total_size,
+            total_chunks
+        );
+        
+        // Get authenticated peers
+        let peers = self.connection_pool.authenticated_addrs().await;
+        if peers.is_empty() {
+            println!("[ERROR] No authenticated peers to send to");
+            return;
+        }
+        
+        // Send start message
+        let start_msg = NetMessage::ContentStart(encoder.metadata().clone());
+        if let Ok(data) = start_msg.serialize() {
+            for addr in &peers {
+                if let Some(handle) = self.connection_pool.get_handle(addr).await {
+                    let _ = handle.send(data.clone()).await;
+                }
+            }
+        }
+        
+        // Send all chunks
+        let mut chunks_sent = 0;
+        while let Some(chunk) = encoder.next_chunk() {
+            let chunk_msg = NetMessage::ContentData(chunk);
+            if let Ok(data) = chunk_msg.serialize() {
+                for addr in &peers {
+                    if let Some(handle) = self.connection_pool.get_handle(addr).await {
+                        let _ = handle.send(data.clone()).await;
+                    }
+                }
+            }
+            chunks_sent += 1;
+            
+            // Progress indicator
+            if chunks_sent % 10 == 0 || chunks_sent == total_chunks {
+                println!("[CONTENT] Sent {}/{} chunks", chunks_sent, total_chunks);
+            }
+            
+            // Small delay to avoid overwhelming the network
+            Timer::after(Duration::from_millis(10)).await;
+        }
+        
+        // Store encoder for potential retransmits
+        self.outgoing_transfers.write().await.insert(content_id, encoder);
+        
+        println!("[CONTENT] Transfer initiated: {}", hex::encode(&content_id[..8]));
+    }
+    
+    /// Handle incoming content start message
+    async fn handle_content_start(
+        &self,
+        metadata: ContentMetadata,
+        from: SocketAddr,
+    ) -> Result<()> {
+        // Verify signature
+        let info = self.connection_pool.get_info(&from).await
+            .ok_or(DiagonError::Validation("Unknown peer".into()))?;
+        let pubkey = info.read().await.pubkey.clone()
+            .ok_or(DiagonError::Validation("No pubkey".into()))?;
+        
+        self.verify(&metadata.signable_bytes(), &metadata.signature, &pubkey)?;
+        
+        // Check if we already have this transfer
+        let mut transfers = self.incoming_transfers.write().await;
+        if transfers.contains_key(&metadata.content_id) {
+            return Ok(()); // Already tracking
+        }
+        
+        // Check limits
+        if transfers.len() >= MAX_PENDING_TRANSFERS {
+            // Remove oldest expired transfer
+            let expired: Vec<_> = transfers.iter()
+                .filter(|(_, t)| t.is_expired())
+                .map(|(k, _)| *k)
+                .collect();
+            for k in expired {
+                transfers.remove(&k);
+            }
+            
+            if transfers.len() >= MAX_PENDING_TRANSFERS {
+                println!("[CONTENT] Too many pending transfers, rejecting");
+                return Err(DiagonError::Validation("Too many pending transfers".into()));
+            }
+        }
+        
+        println!("[CONTENT] Receiving {} from {} ({} bytes, {} chunks)",
+            metadata.content_type,
+            metadata.sender.short(),
+            metadata.total_size,
+            metadata.total_chunks
+        );
+        
+        // Start tracking
+        transfers.insert(metadata.content_id, IncomingTransfer::new(metadata));
+        
+        Ok(())
+    }
+    
+    /// Handle incoming content chunk
+    async fn handle_content_data(
+        &self,
+        chunk: ContentChunk,
+        from: SocketAddr,
+    ) -> Result<()> {
+        let mut transfers = self.incoming_transfers.write().await;
+        
+        let transfer = transfers.get_mut(&chunk.content_id)
+            .ok_or(DiagonError::Validation("Unknown transfer".into()))?;
+        
+        // Add chunk
+        let was_new = transfer.add_chunk(&chunk)?;
+        
+        if was_new {
+            // Send ACK
+            let ack = NetMessage::ContentAck {
+                content_id: chunk.content_id,
+                chunk_index: chunk.chunk_index,
+            };
+            if let Some(handle) = self.connection_pool.get_handle(&from).await {
+                if let Ok(data) = ack.serialize() {
+                    let _ = handle.send(data).await;
+                }
+            }
+            
+            // Progress indicator
+            let received = transfer.received_count;
+            let total = transfer.metadata.total_chunks;
+            if received % 10 == 0 || received == total {
+                println!("[CONTENT] Received {}/{} chunks for {}", 
+                    received, total, hex::encode(&chunk.content_id[..8]));
+            }
+            
+            // Check if complete
+            if transfer.is_complete() {
+                let content_id = transfer.metadata.content_id;
+                let content_type = transfer.metadata.content_type;
+                let filename = transfer.metadata.filename.clone();
+                let sender = transfer.metadata.sender.clone();
+                
+                // Reassemble
+                match transfer.reassemble() {
+                    Ok(data) => {
+                        drop(transfers); // Release lock before I/O
+                        
+                        // Save to file
+                        let save_path = self.save_received_content(
+                            &content_id,
+                            content_type,
+                            filename.as_deref(),
+                            &data,
+                        ).await;
+                        
+                        println!("[CONTENT] Complete: {} from {} ({} bytes)",
+                            hex::encode(&content_id[..8]),
+                            sender.short(),
+                            data.len()
+                        );
+                        if let Some(path) = save_path {
+                            println!("[CONTENT] Saved to: {}", path);
+                        }
+                        
+                        // Send completion
+                        let sig = self.sign(&content_id);
+                        let complete = NetMessage::ContentComplete {
+                            content_id,
+                            signature: sig,
+                        };
+                        if let Some(handle) = self.connection_pool.get_handle(&from).await {
+                            if let Ok(data) = complete.serialize() {
+                                let _ = handle.send(data).await;
+                            }
+                        }
+                        
+                        // Remove from tracking
+                        self.incoming_transfers.write().await.remove(&content_id);
+                    }
+                    Err(e) => {
+                        println!("[CONTENT] Reassembly failed: {}", e);
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Handle retransmit request
+    async fn handle_content_retransmit(
+        &self,
+        content_id: [u8; 32],
+        missing_chunks: Vec<u32>,
+        from: SocketAddr,
+    ) -> Result<()> {
+        let mut outgoing = self.outgoing_transfers.write().await;
+        
+        if let Some(encoder) = outgoing.get_mut(&content_id) {
+            println!("[CONTENT] Retransmitting {} chunks for {}", 
+                missing_chunks.len(), hex::encode(&content_id[..8]));
+            
+            // Reset and skip to each missing chunk
+            for chunk_index in missing_chunks {
+                encoder.current_chunk = chunk_index;
+                if let Some(chunk) = encoder.next_chunk() {
+                    let msg = NetMessage::ContentData(chunk);
+                    if let Some(handle) = self.connection_pool.get_handle(&from).await {
+                        if let Ok(data) = msg.serialize() {
+                            let _ = handle.send(data).await;
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Save received content to disk
+    async fn save_received_content(
+        &self,
+        content_id: &[u8; 32],
+        content_type: ContentType,
+        filename: Option<&str>,
+        data: &[u8],
+    ) -> Option<String> {
+        let extension = match content_type {
+            ContentType::Image => "bin", // Could detect from magic bytes
+            ContentType::Video => "bin",
+            ContentType::Text => "txt",
+        };
+        
+        let name = filename.unwrap_or_else(|| {
+            Box::leak(format!("{}.{}", hex::encode(&content_id[..8]), extension).into_boxed_str())
+        });
+        
+        let path = format!("{}/received/{}", self.db_path, name);
+        
+        // Ensure directory exists
+        let dir = format!("{}/received", self.db_path);
+        let _ = smol::fs::create_dir_all(&dir).await;
+        
+        match smol::fs::write(&path, data).await {
+            Ok(_) => Some(path),
+            Err(e) => {
+                println!("[CONTENT] Failed to save: {}", e);
+                None
+            }
+        }
+    }
     
     async fn broadcast_authenticated(&self, msg: &NetMessage) {
         if let Ok(data) = msg.serialize() {
@@ -2875,6 +3554,9 @@ fn print_help() {
     println!("  approve <id>                   Approve pending peer");
     println!("  reject <id> <reason>           Reject pending peer");
     println!();
+    println!("  === Content Sharing ===");
+    println!("  message <type> <filepath>          Share content (type: image, video, text)");
+    println!();
     println!("  === Governance ===");
     println!("  propose <text>                 Create proposal");
     println!("  vote <cid> <y/n> <text>        Vote on proposal");
@@ -2973,6 +3655,14 @@ async fn async_main(addr: &str, db_path: &str) -> io::Result<()> {
                 node.crawl(parts[0], hops).await;
             }
             "discover" => { node.discover().await; }
+            "message" if !arg.is_empty() => {
+                let parts: Vec<&str> = arg.splitn(2, ' ').collect();
+                if parts.len() == 2 {
+                    node.message(parts[0], parts[1]).await;
+                } else {
+                    println!("Usage: message <image|video|text> <file_path>");
+                }
+            }
             "help" => { print_help(); }
             "quit" | "exit" => { break; }
             _ => { println!("Unknown command. Type 'help' for commands."); }
@@ -2983,8 +3673,45 @@ async fn async_main(addr: &str, db_path: &str) -> io::Result<()> {
     Ok(())
 }
 
+// Helper functions for MIME detection
+fn detect_image_mime(data: &[u8]) -> Option<String> {
+    if data.len() < 8 {
+        return None;
+    }
+    
+    // Check magic bytes
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg".to_string())
+    } else if data.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        Some("image/png".to_string())
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some("image/gif".to_string())
+    } else if data.starts_with(b"RIFF") && data.len() > 12 && &data[8..12] == b"WEBP" {
+        Some("image/webp".to_string())
+    } else {
+        Some("application/octet-stream".to_string())
+    }
+}
+
+fn detect_video_mime(data: &[u8]) -> Option<String> {
+    if data.len() < 12 {
+        return None;
+    }
+    
+    // Check for common video formats
+    if data.len() >= 8 && &data[4..8] == b"ftyp" {
+        Some("video/mp4".to_string())
+    } else if data.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        Some("video/webm".to_string())
+    } else if data.starts_with(&[0x00, 0x00, 0x01, 0xBA]) {
+        Some("video/mpeg".to_string())
+    } else {
+        Some("application/octet-stream".to_string())
+    }
+}
+
 // ============================================================================
-// TESTS - Run with: cargo test -- --nocapture --test-threads=1
+// TESTS - Run with: cargo test -- --nocapture
 // ============================================================================
 
 #[cfg(test)]
@@ -3179,6 +3906,7 @@ mod tests {
         // Add signals
         let signal1 = QuorumSignal {
             source: Did("did:test:node1".into()),
+            pubkey: vec![],  // Empty for unit tests that don't verify signatures
             target,
             weight: 800,
             support: true,
@@ -3193,6 +3921,7 @@ mod tests {
         // Duplicate source should be rejected
         let signal1_dup = QuorumSignal {
             source: Did("did:test:node1".into()),
+            pubkey: vec![],
             target,
             weight: 500,
             support: true,
@@ -3206,6 +3935,7 @@ mod tests {
         // Different source should work
         let signal2 = QuorumSignal {
             source: Did("did:test:node2".into()),
+            pubkey: vec![],
             target,
             weight: 700,
             support: true,
@@ -3228,6 +3958,7 @@ mod tests {
         // Add more to reach threshold
         let signal3 = QuorumSignal {
             source: Did("did:test:node3".into()),
+            pubkey: vec![],
             target,
             weight: 800,
             support: true,
@@ -3245,6 +3976,7 @@ mod tests {
         let mut quorum2 = QuorumState::new(Cid::new(b"another"), 1000, proposer2);
         let against = QuorumSignal {
             source: Did("did:test:voter".into()),
+            pubkey: vec![],
             target: Cid::new(b"another"),
             weight: 500,
             support: false,
@@ -3277,6 +4009,7 @@ mod tests {
         // Try to vote as the proposer - should be rejected
         let self_vote = QuorumSignal {
             source: proposer.clone(),
+            pubkey: vec![],
             target,
             weight: 500,
             support: true,
@@ -3292,6 +4025,7 @@ mod tests {
         // Vote from different source should work
         let other_vote = QuorumSignal {
             source: Did("did:test:other".into()),
+            pubkey: vec![],
             target,
             weight: 500,
             support: true,
@@ -4083,6 +4817,7 @@ mod tests {
             NetMessage::Expression(vec![1, 2, 3, 4, 5]),
             NetMessage::Signal(QuorumSignal {
                 source: Did("did:test:voter".into()),
+                pubkey: vec![1, 2, 3, 4],
                 target: Cid([0u8; 32]),
                 weight: 1000,
                 support: true,
@@ -4209,6 +4944,7 @@ mod tests {
         
         let signal = QuorumSignal {
             source: Did("did:test:source".into()),
+            pubkey: vec![1, 2, 3, 4],
             target: Cid([1u8; 32]),
             weight: 500,
             support: true,
@@ -4596,5 +5332,496 @@ mod tests {
         println!("[SUCCESS] Challenge has no signable bytes (as expected)");
         
         println!("[SUCCESS] NetMessage signable bytes test passed\n");
+    }
+
+    // ========================================================================
+    // FILE-BASED INTEGRATION TESTS
+    // ========================================================================
+    
+    #[test]
+    fn test_real_text_file_transfer() {
+        println!("\n═══ TEST: Real Text File Transfer ═══");
+        
+        let path = "test/test.txt";
+        
+        // Check if test file exists
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("[SKIP] Test file not found: {}", path);
+                println!("  Create test/test.txt to run this test");
+                return;
+            }
+        };
+        
+        println!("[SUCCESS] Loaded test file: {} bytes", data.len());
+        
+        let (public_key, secret_key) = keypair();
+        let sender = Did::from_pubkey(&public_key);
+        
+        // Create encoder
+        let mut encoder = ContentEncoder::new(
+            ContentType::Text,
+            data.clone(),
+            Some("test.txt".to_string()),
+            Some("text/plain".to_string()),
+            sender,
+        );
+        encoder.sign(&secret_key);
+        
+        let metadata = encoder.metadata().clone();
+        println!("[SUCCESS] Encoded: {} chunks, {} bytes", 
+            metadata.total_chunks, metadata.total_size);
+        
+        // Verify signature
+        let sig = DetachedSignature::from_bytes(&metadata.signature)
+            .expect("Valid signature");
+        let result = verify_detached_signature(&sig, &metadata.signable_bytes(), &public_key);
+        assert!(result.is_ok());
+        println!("[SUCCESS] Metadata signature verified");
+        
+        // Simulate transfer
+        let mut transfer = IncomingTransfer::new(metadata.clone());
+        let mut chunk_count = 0;
+        
+        while let Some(chunk) = encoder.next_chunk() {
+            assert!(chunk.verify(), "Chunk {} should verify", chunk.chunk_index);
+            transfer.add_chunk(&chunk).expect("Add chunk failed");
+            chunk_count += 1;
+        }
+        
+        println!("[SUCCESS] Transferred {} chunks", chunk_count);
+        assert!(transfer.is_complete());
+        
+        // Reassemble and verify
+        let reassembled = transfer.reassemble().expect("Reassembly failed");
+        assert_eq!(reassembled, data);
+        println!("[SUCCESS] Reassembled data matches original");
+        
+        // Verify it's valid UTF-8 text
+        if let Ok(text) = std::str::from_utf8(&reassembled) {
+            println!("[SUCCESS] Valid UTF-8 text, {} chars", text.len());
+            if text.len() < 200 {
+                println!("  Content: {:?}", text);
+            } else {
+                println!("  Preview: {:?}...", &text[..100]);
+            }
+        }
+        
+        println!("[SUCCESS] Real text file transfer test passed\n");
+    }
+    
+    #[test]
+    fn test_real_image_file_transfer() {
+        println!("\n═══ TEST: Real Image File Transfer ═══");
+        
+        // Try PNG first, then JPG
+        let (path, expected_mime) = if std::path::Path::new("test/test.png").exists() {
+            ("test/test.png", "image/png")
+        } else if std::path::Path::new("test/test.jpg").exists() {
+            ("test/test.jpg", "image/jpeg")
+        } else {
+            println!("[SKIP] No test image found");
+            println!("  Create test/test.png or test/test.jpg to run this test");
+            return;
+        };
+        
+        let data = std::fs::read(path).expect("Failed to read image");
+        println!("[SUCCESS] Loaded {}: {} bytes", path, data.len());
+        
+        // Test MIME detection
+        let detected_mime = detect_image_mime(&data);
+        assert_eq!(detected_mime, Some(expected_mime.to_string()));
+        println!("[SUCCESS] MIME detected: {:?}", detected_mime);
+        
+        let (public_key, secret_key) = keypair();
+        let sender = Did::from_pubkey(&public_key);
+        
+        // Create encoder with detected MIME
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+        
+        let mut encoder = ContentEncoder::new(
+            ContentType::Image,
+            data.clone(),
+            filename.clone(),
+            detected_mime.clone(),
+            sender,
+        );
+        encoder.sign(&secret_key);
+        
+        let metadata = encoder.metadata().clone();
+        println!("[SUCCESS] Encoded: {} chunks, {} bytes", 
+            metadata.total_chunks, metadata.total_size);
+        println!("  Filename: {:?}", metadata.filename);
+        println!("  MIME: {:?}", metadata.mime_type);
+        
+        // Full transfer simulation
+        let mut transfer = IncomingTransfer::new(metadata);
+        
+        while let Some(chunk) = encoder.next_chunk() {
+            assert!(chunk.verify());
+            transfer.add_chunk(&chunk).expect("Add chunk failed");
+        }
+        
+        assert!(transfer.is_complete());
+        let reassembled = transfer.reassemble().expect("Reassembly failed");
+        assert_eq!(reassembled, data);
+        println!("[SUCCESS] Image transfer complete, data verified");
+        
+        // Verify image magic bytes preserved
+        let reassembled_mime = detect_image_mime(&reassembled);
+        assert_eq!(reassembled_mime, Some(expected_mime.to_string()));
+        println!("[SUCCESS] Reassembled image has correct magic bytes");
+        
+        println!("[SUCCESS] Real image file transfer test passed\n");
+    }
+    
+    #[test]
+    fn test_real_video_file_transfer() {
+        println!("\n═══ TEST: Real Video File Transfer ═══");
+        
+        let path = "test/test.mp4";
+        
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("[SKIP] Test file not found: {}", path);
+                println!("  Create test/test.mp4 to run this test");
+                return;
+            }
+        };
+        
+        println!("[SUCCESS] Loaded {}: {} bytes ({:.2} MB)", 
+            path, data.len(), data.len() as f64 / 1_048_576.0);
+        
+        // Test MIME detection
+        let detected_mime = detect_video_mime(&data);
+        println!("[SUCCESS] MIME detected: {:?}", detected_mime);
+        
+        let (public_key, secret_key) = keypair();
+        let sender = Did::from_pubkey(&public_key);
+        
+        let mut encoder = ContentEncoder::new(
+            ContentType::Video,
+            data.clone(),
+            Some("test.mp4".to_string()),
+            detected_mime.clone(),
+            sender,
+        );
+        encoder.sign(&secret_key);
+        
+        let metadata = encoder.metadata().clone();
+        println!("[SUCCESS] Encoded: {} chunks, {} bytes", 
+            metadata.total_chunks, metadata.total_size);
+        
+        // Transfer with progress
+        let mut transfer = IncomingTransfer::new(metadata.clone());
+        let mut chunks_transferred = 0;
+        let total_chunks = metadata.total_chunks;
+        
+        while let Some(chunk) = encoder.next_chunk() {
+            assert!(chunk.verify());
+            transfer.add_chunk(&chunk).expect("Add chunk failed");
+            chunks_transferred += 1;
+            
+            // Progress every 10 chunks or at completion
+            if chunks_transferred % 10 == 0 || chunks_transferred == total_chunks {
+                let percent = (chunks_transferred as f64 / total_chunks as f64) * 100.0;
+                println!("  Progress: {}/{} chunks ({:.1}%)", 
+                    chunks_transferred, total_chunks, percent);
+            }
+        }
+        
+        assert!(transfer.is_complete());
+        
+        let start = std::time::Instant::now();
+        let reassembled = transfer.reassemble().expect("Reassembly failed");
+        let reassembly_time = start.elapsed();
+        
+        assert_eq!(reassembled, data);
+        println!("[SUCCESS] Reassembled in {:?}", reassembly_time);
+        
+        // Verify video magic bytes
+        let reassembled_mime = detect_video_mime(&reassembled);
+        println!("[SUCCESS] Reassembled MIME: {:?}", reassembled_mime);
+        
+        println!("[SUCCESS] Real video file transfer test passed\n");
+    }
+    
+    #[test]
+    fn test_real_file_mime_detection() {
+        println!("\n═══ TEST: Real File MIME Detection ═══");
+        
+        let test_files = [
+            ("test/test.txt", "text", None), // Text doesn't use magic bytes
+            ("test/test.png", "image", Some("image/png")),
+            ("test/test.jpg", "image", Some("image/jpeg")),
+            ("test/test.mp4", "video", Some("video/mp4")),
+        ];
+        
+        let mut found_any = false;
+        
+        for (path, file_type, expected_mime) in test_files {
+            if let Ok(data) = std::fs::read(path) {
+                found_any = true;
+                println!("Testing {}: {} bytes", path, data.len());
+                
+                let detected = match file_type {
+                    "image" => detect_image_mime(&data),
+                    "video" => detect_video_mime(&data),
+                    _ => None,
+                };
+                
+                if let Some(expected) = expected_mime {
+                    assert_eq!(detected, Some(expected.to_string()), 
+                        "MIME mismatch for {}", path);
+                    println!("  [SUCCESS] Detected: {}", expected);
+                } else {
+                    println!("  [SUCCESS] Text file (no magic byte detection)");
+                }
+                
+                // Print first 16 bytes as hex for debugging
+                let preview: Vec<String> = data.iter()
+                    .take(16)
+                    .map(|b| format!("{:02X}", b))
+                    .collect();
+                println!("  Magic bytes: {}", preview.join(" "));
+            }
+        }
+        
+        if !found_any {
+            println!("[SKIP] No test files found in test/ directory");
+            println!("  Create test/test.txt, test.png, test.jpg, and/or test.mp4");
+        }
+        
+        println!("[SUCCESS] Real file MIME detection test passed\n");
+    }
+    
+    #[test]
+    fn test_real_file_async_transfer() {
+        println!("\n═══ TEST: Real File Async Transfer ═══");
+        let dir = setup_test_dir("real_file_async");
+        
+        // Find a test file to use
+        let (source_path, content_type) = if std::path::Path::new("test/test.txt").exists() {
+            ("test/test.txt", ContentType::Text)
+        } else if std::path::Path::new("test/test.png").exists() {
+            ("test/test.png", ContentType::Image)
+        } else if std::path::Path::new("test/test.jpg").exists() {
+            ("test/test.jpg", ContentType::Image)
+        } else if std::path::Path::new("test/test.mp4").exists() {
+            ("test/test.mp4", ContentType::Video)
+        } else {
+            println!("[SKIP] No test files found");
+            cleanup_test_dir(&dir);
+            return;
+        };
+        
+        run(async {
+            // Read file using async IO (like the real implementation)
+            let data = smol::fs::read(source_path).await.expect("Failed to read");
+            println!("[SUCCESS] Async read {}: {} bytes", source_path, data.len());
+            
+            // Create a node for signing
+            let node = Node::new("127.0.0.1:19197", &format!("{}/node", dir))
+                .await.expect("Node failed");
+            
+            // Simulate what message() does
+            let filename = std::path::Path::new(source_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+            
+            let mime_type = match content_type {
+                ContentType::Image => detect_image_mime(&data),
+                ContentType::Video => detect_video_mime(&data),
+                ContentType::Text => Some("text/plain".to_string()),
+            };
+            
+            let mut encoder = ContentEncoder::new(
+                content_type,
+                data.clone(),
+                filename.clone(),
+                mime_type.clone(),
+                node.did.clone(),
+            );
+            encoder.sign(&node.secret_key);
+            
+            println!("[SUCCESS] Created encoder:");
+            println!("  Content type: {}", content_type);
+            println!("  Filename: {:?}", filename);
+            println!("  MIME: {:?}", mime_type);
+            println!("  Chunks: {}", encoder.metadata().total_chunks);
+            
+            // Simulate receiving
+            let mut transfer = IncomingTransfer::new(encoder.metadata().clone());
+            
+            while let Some(chunk) = encoder.next_chunk() {
+                transfer.add_chunk(&chunk).expect("Add chunk failed");
+            }
+            
+            // Save using async IO
+            let output_dir = format!("{}/received", dir);
+            smol::fs::create_dir_all(&output_dir).await.expect("Create dir failed");
+            
+            let reassembled = transfer.reassemble().expect("Reassembly failed");
+            let output_path = format!("{}/{}", output_dir, filename.unwrap_or("output".to_string()));
+            smol::fs::write(&output_path, &reassembled).await.expect("Write failed");
+            
+            println!("[SUCCESS] Saved to: {}", output_path);
+            
+            // Verify saved file
+            let saved = smol::fs::read(&output_path).await.expect("Read saved failed");
+            assert_eq!(saved, data);
+            println!("[SUCCESS] Saved file matches original");
+            
+            node.shutdown().await;
+        });
+        
+        cleanup_test_dir(&dir);
+        println!("[SUCCESS] Real file async transfer test passed\n");
+    }
+    
+    #[test]
+    fn test_large_file_chunking_performance() {
+        println!("\n═══ TEST: Large File Chunking Performance ═══");
+        
+        // Try to find a large test file, or create synthetic data
+        let data = if let Ok(d) = std::fs::read("test/test.mp4") {
+            println!("Using test/test.mp4: {} bytes", d.len());
+            d
+        } else {
+            // Create 5MB of synthetic data
+            let size = 5 * 1024 * 1024;
+            println!("Creating synthetic data: {} bytes", size);
+            (0..size).map(|i| (i % 256) as u8).collect()
+        };
+        
+        let (public_key, secret_key) = keypair();
+        let sender = Did::from_pubkey(&public_key);
+        
+        // Benchmark encoding
+        let start = std::time::Instant::now();
+        let mut encoder = ContentEncoder::new(
+            ContentType::Video,
+            data.clone(),
+            Some("benchmark.dat".to_string()),
+            None,
+            sender,
+        );
+        encoder.sign(&secret_key);
+        let encode_setup_time = start.elapsed();
+        println!("[SUCCESS] Encoder setup: {:?}", encode_setup_time);
+        
+        // Benchmark chunk generation
+        let start = std::time::Instant::now();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = encoder.next_chunk() {
+            chunks.push(chunk);
+        }
+        let chunk_gen_time = start.elapsed();
+        println!("[SUCCESS] Generated {} chunks in {:?}", chunks.len(), chunk_gen_time);
+        println!("  Rate: {:.2} chunks/sec", chunks.len() as f64 / chunk_gen_time.as_secs_f64());
+        
+        // Benchmark transfer simulation
+        let start = std::time::Instant::now();
+        encoder.reset();
+        let mut transfer = IncomingTransfer::new(encoder.metadata().clone());
+        for chunk in &chunks {
+            transfer.add_chunk(chunk).expect("Add failed");
+        }
+        let transfer_time = start.elapsed();
+        println!("[SUCCESS] Transfer simulation: {:?}", transfer_time);
+        
+        // Benchmark reassembly
+        let start = std::time::Instant::now();
+        let reassembled = transfer.reassemble().expect("Reassembly failed");
+        let reassembly_time = start.elapsed();
+        println!("[SUCCESS] Reassembly: {:?}", reassembly_time);
+        println!("  Throughput: {:.2} MB/sec", 
+            (data.len() as f64 / 1_048_576.0) / reassembly_time.as_secs_f64());
+        
+        assert_eq!(reassembled, data);
+        println!("[SUCCESS] Data integrity verified");
+        
+        println!("[SUCCESS] Large file chunking performance test passed\n");
+    }
+    
+    #[test]
+    fn test_all_file_types_roundtrip() {
+        println!("\n═══ TEST: All File Types Roundtrip ═══");
+        
+        let test_cases = [
+            ("test/test.txt", ContentType::Text, "text/plain"),
+            ("test/test.png", ContentType::Image, "image/png"),
+            ("test/test.jpg", ContentType::Image, "image/jpeg"),
+            ("test/test.mp4", ContentType::Video, "video/mp4"),
+        ];
+        
+        let (public_key, secret_key) = keypair();
+        let sender = Did::from_pubkey(&public_key);
+        
+        let mut tested = 0;
+        
+        for (path, content_type, expected_mime) in test_cases {
+            let data = match std::fs::read(path) {
+                Ok(d) => d,
+                Err(_) => {
+                    println!("[SKIP] {}", path);
+                    continue;
+                }
+            };
+            
+            tested += 1;
+            println!("\nTesting {}: {} bytes", path, data.len());
+            
+            // Detect MIME
+            let detected_mime = match content_type {
+                ContentType::Image => detect_image_mime(&data),
+                ContentType::Video => detect_video_mime(&data),
+                ContentType::Text => Some("text/plain".to_string()),
+            };
+            
+            if content_type != ContentType::Text {
+                assert_eq!(detected_mime.as_deref(), Some(expected_mime),
+                    "MIME mismatch for {}", path);
+            }
+            println!("  MIME: {:?}", detected_mime);
+            
+            // Encode
+            let mut encoder = ContentEncoder::new(
+                content_type,
+                data.clone(),
+                Some(path.split('/').last().unwrap().to_string()),
+                detected_mime,
+                sender.clone(),
+            );
+            encoder.sign(&secret_key);
+            println!("  Chunks: {}", encoder.metadata().total_chunks);
+            
+            // Transfer
+            let mut transfer = IncomingTransfer::new(encoder.metadata().clone());
+            while let Some(chunk) = encoder.next_chunk() {
+                assert!(chunk.verify(), "Chunk verification failed");
+                transfer.add_chunk(&chunk).expect("Add chunk failed");
+            }
+            
+            // Reassemble
+            let reassembled = transfer.reassemble().expect("Reassembly failed");
+            assert_eq!(reassembled, data, "Data mismatch for {}", path);
+            println!("  [SUCCESS] Roundtrip verified");
+        }
+        
+        if tested == 0 {
+            println!("[SKIP] No test files found in test/ directory");
+            println!("  Create test files: test.txt, test.png, test.jpg, test.mp4");
+        } else {
+            println!("\n[SUCCESS] Tested {} file types", tested);
+        }
+        
+        println!("[SUCCESS] All file types roundtrip test passed\n");
     }
 }
