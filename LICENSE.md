@@ -1,7 +1,7 @@
 # QUORUM SOURCE-AVAILABLE LICENSE
 ## Version 1.0
 
-Copyright (c) [YEAR] [COPYRIGHT HOLDER NAME]
+Copyright (c) [2025] [Quorum IO]
 
 ---
 
