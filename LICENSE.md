@@ -206,7 +206,7 @@ This License constitutes the entire agreement between You and the copyright hold
 
 For commercial licensing inquiries, Seat purchases, or questions about this License:
 
-**[COPYRIGHT HOLDER NAME]**  
+**[Quorum IO]**  
 **Email:** [EMAIL ADDRESS]  
 **Address:** [MAILING ADDRESS]  
 **Website:** https://quorum-io.github.io/homepage/
@@ -218,7 +218,7 @@ For commercial licensing inquiries, Seat purchases, or questions about this Lice
 To apply this License to your software, include the following notice at the beginning of each source file:
 
 ```
-Copyright (c) [YEAR] [COPYRIGHT HOLDER NAME]
+Copyright (c) [2025] [Quorum IO]
 
 This software is licensed under the Quorum Source-Available License v1.0.
 
@@ -229,7 +229,7 @@ You may view and run this software subject to the following conditions:
 Modification and redistribution are NOT permitted.
 
 See the LICENSE file for complete terms and conditions.
-For commercial licensing: [EMAIL]
+For commercial licensing: File Issue in Quorum IO/Node Repository.
 ```
 
 Include the complete LICENSE file in your distribution.
