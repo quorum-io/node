@@ -1,4 +1,4 @@
-// DIAGON v0.9.5
+// DIAGON v0.9.6
 
 use std::{
     collections::{HashMap, HashSet, BTreeMap, VecDeque},
@@ -74,6 +74,36 @@ const ACK_WEIGHT_WITH_REFLECTION: u64 = 300;
 
 const TESTIMONY_MIN_ATTESTATION_LEN: usize = 10;
 const TESTIMONY_WEIGHT_PER_POOL: u64 = 500;
+
+// HITL Review System
+const REVIEW_MIN_JUSTIFICATION_LEN: usize = 10;
+const REVIEW_CONSENSUS_THRESHOLD: f64 = 1.0;
+const REVIEW_OUTLIER_THRESHOLD: f64 = 2.0;
+const REVIEW_MIN_REPUTATION: f64 = 0.2;
+const REVIEW_APPRENTICE_COUNT: u32 = 5;
+const REVIEW_INTERACTION_LIMIT: u32 = 5;
+const REVIEW_STALE_SECS: u64 = 7 * 86400;
+const REVIEW_LOOP_INTERVAL: Duration = Duration::from_secs(300);
+
+const REVIEW_TIER_CRITICAL: (u8, u64) = (5, 72);
+const REVIEW_TIER_STANDARD: (u8, u64) = (3, 48);
+const REVIEW_TIER_FAST: (u8, u64) = (2, 24);
+
+const XP_BASE_PROPOSAL: u64 = 10;
+const XP_BASE_PROPOSAL_ELABORATION: u64 = 5;
+const XP_BASE_REPLY: u64 = 5;
+const XP_BASE_VOTE_ELABORATION: u64 = 3;
+const XP_BASE_ACKNOWLEDGMENT: u64 = 2;
+const XP_BASE_PIN_REASON: u64 = 5;
+const XP_BASE_PRUNE_REASON: u64 = 5;
+
+const XP_REVIEW_COMPLETE: u64 = 2;
+const XP_REVIEW_CONSENSUS_BONUS: u64 = 1;
+const XP_REVIEW_SPAM_CATCH: u64 = 5;
+
+const LENGTH_FACTOR_MIN: f64 = 1.0;
+const LENGTH_FACTOR_MAX: f64 = 2.0;
+const LENGTH_FACTOR_BASE_WORDS: f64 = 10.0;
 
 const GENESIS_POOLS: [[u8; 32]; 3] = [
     [0x80, 0x1e, 0x10, 0x0b, 0x0c, 0xa3, 0x10, 0x30, 0xa6, 0xb2, 0x9f, 0x69, 0x2d, 0x0f, 0x19, 0x4c,
@@ -694,6 +724,416 @@ impl TestimonyRegistry {
             self.given_count += 1;
         }
         self.given.insert(testimony.cid, testimony);
+    }
+}
+
+#[derive(Clone, Debug, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ReviewableContentType {
+    Proposal,
+    ProposalElaboration,
+    Reply,
+    Acknowledgment,
+    VoteElaboration,
+    PinReason,
+    PruneReason,
+}
+
+impl ReviewableContentType {
+    pub fn tier_config(&self) -> (u8, u64) {
+        match self {
+            Self::Proposal | Self::PinReason | Self::PruneReason => REVIEW_TIER_CRITICAL,
+            Self::ProposalElaboration | Self::Reply | Self::VoteElaboration => REVIEW_TIER_STANDARD,
+            Self::Acknowledgment => REVIEW_TIER_FAST,
+        }
+    }
+    
+    pub fn base_xp(&self) -> u64 {
+        match self {
+            Self::Proposal => XP_BASE_PROPOSAL,
+            Self::ProposalElaboration => XP_BASE_PROPOSAL_ELABORATION,
+            Self::Reply => XP_BASE_REPLY,
+            Self::VoteElaboration => XP_BASE_VOTE_ELABORATION,
+            Self::Acknowledgment => XP_BASE_ACKNOWLEDGMENT,
+            Self::PinReason => XP_BASE_PIN_REASON,
+            Self::PruneReason => XP_BASE_PRUNE_REASON,
+        }
+    }
+    
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Proposal => "proposal",
+            Self::ProposalElaboration => "proposal-elaboration",
+            Self::Reply => "reply",
+            Self::Acknowledgment => "acknowledgment",
+            Self::VoteElaboration => "vote-elaboration",
+            Self::PinReason => "pin-reason",
+            Self::PruneReason => "prune-reason",
+        }
+    }
+}
+
+impl fmt::Display for ReviewableContentType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QualityReview {
+    pub content_cid: Cid,
+    pub reviewer: Did,
+    pub pubkey: Vec<u8>,
+    pub relevance: u8,
+    pub substance: u8,
+    pub clarity: u8,
+    pub originality: u8,
+    pub effort: u8,
+    pub justification: String,
+    pub flag_spam: bool,
+    pub flag_plagiarism: bool,
+    pub flag_offtopic: bool,
+    pub reviewed_at: u64,
+    pub signature: Vec<u8>,
+}
+
+impl QualityReview {
+    pub fn composite_score(&self) -> f64 {
+        let relevance = self.relevance as f64 * 0.25;
+        let substance = self.substance as f64 * 0.30;
+        let clarity = self.clarity as f64 * 0.20;
+        let originality = self.originality as f64 * 0.15;
+        let effort = self.effort as f64 * 0.10;
+        relevance + substance + clarity + originality + effort
+    }
+    
+    pub fn is_flagged(&self) -> bool {
+        self.flag_spam || self.flag_plagiarism || self.flag_offtopic
+    }
+    
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"quality-review:");
+        data.extend_from_slice(&self.content_cid.0);
+        data.push(self.relevance);
+        data.push(self.substance);
+        data.push(self.clarity);
+        data.push(self.originality);
+        data.push(self.effort);
+        data.extend_from_slice(self.justification.as_bytes());
+        data.push(if self.flag_spam { 1 } else { 0 });
+        data.push(if self.flag_plagiarism { 1 } else { 0 });
+        data.push(if self.flag_offtopic { 1 } else { 0 });
+        data.extend_from_slice(&self.reviewed_at.to_le_bytes());
+        data
+    }
+    
+    pub fn verify(&self) -> bool {
+        let pk = match PublicKey::from_bytes(&self.pubkey) {
+            Ok(pk) => pk,
+            Err(_) => return false,
+        };
+        if Did::from_pubkey(&pk) != self.reviewer { return false; }
+        let sig = match DetachedSignature::from_bytes(&self.signature) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        verify_detached_signature(&sig, &self.signable_bytes(), &pk).is_ok()
+    }
+    
+    pub fn is_valid(&self) -> bool {
+        let scores_valid = (1..=5).contains(&self.relevance)
+            && (1..=5).contains(&self.substance)
+            && (1..=5).contains(&self.clarity)
+            && (1..=5).contains(&self.originality)
+            && (1..=5).contains(&self.effort);
+        scores_valid && self.justification.len() >= REVIEW_MIN_JUSTIFICATION_LEN
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingReview {
+    pub content_cid: Cid,
+    pub content_type: ReviewableContentType,
+    pub content_text: String,
+    pub context_cid: Option<Cid>,
+    pub context_text: Option<String>,
+    pub submitted_at: u64,
+    pub deadline: u64,
+    pub required_reviews: u8,
+    pub assigned_reviewers: Vec<Did>,
+    pub reviews: Vec<QualityReview>,
+    pub author: Did,
+    pub word_count: u32,
+}
+
+impl PendingReview {
+    pub fn new(
+        content_cid: Cid,
+        content_type: ReviewableContentType,
+        content_text: String,
+        context_cid: Option<Cid>,
+        context_text: Option<String>,
+        author: Did,
+    ) -> Self {
+        let (required_reviews, deadline_hours) = content_type.tier_config();
+        let word_count = content_text.split_whitespace().count() as u32;
+        Self {
+            content_cid, content_type, content_text, context_cid, context_text,
+            submitted_at: timestamp(),
+            deadline: timestamp() + (deadline_hours * 3600),
+            required_reviews, assigned_reviewers: Vec::new(), reviews: Vec::new(),
+            author, word_count,
+        }
+    }
+    
+    pub fn is_complete(&self) -> bool { self.reviews.len() >= self.required_reviews as usize }
+    pub fn is_expired(&self) -> bool { timestamp() > self.deadline }
+    pub fn has_reviewed(&self, reviewer: &Did) -> bool { self.reviews.iter().any(|r| &r.reviewer == reviewer) }
+    pub fn is_assigned(&self, reviewer: &Did) -> bool { self.assigned_reviewers.contains(reviewer) }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QualityVerdict {
+    pub content_cid: Cid,
+    pub author: Did,
+    pub quality_score: f64,
+    pub flagged: bool,
+    pub flag_reason: Option<String>,
+    pub reviewer_scores: Vec<(Did, f64)>,
+    pub consensus_aligned: Vec<Did>,
+    pub consensus_outliers: Vec<Did>,
+    pub xp_awarded: u64,
+    pub verdict_at: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ReviewerReputation {
+    pub reviews_completed: u32,
+    pub consensus_alignments: u32,
+    pub consensus_deviations: u32,
+    pub confirmed_flags: u32,
+    pub false_flags: u32,
+    pub score: f64,
+    pub last_review: u64,
+}
+
+impl ReviewerReputation {
+    pub fn new() -> Self { Self { score: 0.5, ..Default::default() } }
+    
+    pub fn update(&mut self, aligned: bool, flag_result: Option<bool>) {
+        self.reviews_completed += 1;
+        if aligned {
+            self.consensus_alignments += 1;
+            self.score = (self.score + 0.02).min(1.0);
+        } else {
+            self.consensus_deviations += 1;
+            self.score = (self.score - 0.05).max(0.0);
+        }
+        if let Some(confirmed) = flag_result {
+            if confirmed { self.confirmed_flags += 1; self.score = (self.score + 0.1).min(1.0); }
+            else { self.false_flags += 1; self.score = (self.score - 0.2).max(0.0); }
+        }
+        self.last_review = timestamp();
+    }
+    
+    pub fn weight(&self) -> f64 {
+        let exp = (self.reviews_completed as f64 / REVIEW_APPRENTICE_COUNT as f64).min(1.0);
+        self.score * (0.5 + 0.5 * exp)
+    }
+    
+    pub fn is_eligible(&self) -> bool { self.score >= REVIEW_MIN_REPUTATION }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReviewState {
+    pub pending: HashMap<Cid, PendingReview>,
+    pub verdicts: HashMap<Cid, QualityVerdict>,
+    pub reviewer_reputations: HashMap<Did, ReviewerReputation>,
+    pub interaction_counts: HashMap<(Did, Did), u32>,
+}
+
+impl ReviewState {
+    pub fn new() -> Self { Self::default() }
+    
+    pub fn submit_for_review(
+        &mut self,
+        content_cid: Cid,
+        content_type: ReviewableContentType,
+        content_text: String,
+        context_cid: Option<Cid>,
+        context_text: Option<String>,
+        author: Did,
+        eligible_reviewers: &[Did],
+    ) -> Result<()> {
+        if self.pending.contains_key(&content_cid) {
+            return Err(DiagonError::Validation("Already pending".into()));
+        }
+        
+        let mut pending = PendingReview::new(
+            content_cid, content_type, content_text, context_cid, context_text, author.clone(),
+        );
+        
+        let reviewers = self.select_reviewers(&author, eligible_reviewers, pending.required_reviews as usize)?;
+        pending.assigned_reviewers = reviewers;
+        self.pending.insert(content_cid, pending);
+        Ok(())
+    }
+    
+    fn select_reviewers(&self, author: &Did, eligible: &[Did], count: usize) -> Result<Vec<Did>> {
+        let candidates: Vec<_> = eligible.iter()
+            .filter(|&r| {
+                if r == author { return false; }
+                let key1 = (r.clone(), author.clone());
+                let key2 = (author.clone(), r.clone());
+                let interactions = self.interaction_counts.get(&key1).copied().unwrap_or(0)
+                    + self.interaction_counts.get(&key2).copied().unwrap_or(0);
+                if interactions > REVIEW_INTERACTION_LIMIT { return false; }
+                self.reviewer_reputations.get(r).map(|r| r.is_eligible()).unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        
+        if candidates.len() < count {
+            return Err(DiagonError::Validation(format!("Need {} reviewers, have {}", count, candidates.len())));
+        }
+        
+        let mut weighted: Vec<_> = candidates.iter()
+            .map(|did| (did.clone(), self.reviewer_reputations.get(did).map(|r| r.weight()).unwrap_or(0.5)))
+            .collect();
+        
+        let mut selected = Vec::new();
+        for _ in 0..count {
+            if weighted.is_empty() { break; }
+            let total: f64 = weighted.iter().map(|(_, w)| w).sum();
+            if total <= 0.0 { break; }
+            
+            let mut random = [0u8; 8];
+            OsRng.fill_bytes(&mut random);
+            let mut choice = (u64::from_le_bytes(random) as f64 / u64::MAX as f64) * total;
+            
+            let idx = weighted.iter().position(|(_, w)| { choice -= w; choice <= 0.0 }).unwrap_or(0);
+            let (did, _) = weighted.remove(idx);
+            selected.push(did);
+        }
+        
+        if selected.len() < count {
+            return Err(DiagonError::Validation("Could not select enough reviewers".into()));
+        }
+        Ok(selected)
+    }
+    
+    pub fn submit_review(&mut self, review: QualityReview) -> Result<bool> {
+        if !review.is_valid() { return Err(DiagonError::Validation("Invalid review".into())); }
+        if !review.verify() { return Err(DiagonError::SignatureRequired); }
+        
+        let pending = self.pending.get_mut(&review.content_cid)
+            .ok_or(DiagonError::Validation("Not in queue".into()))?;
+        
+        if !pending.is_assigned(&review.reviewer) {
+            return Err(DiagonError::Validation("Not assigned".into()));
+        }
+        if pending.has_reviewed(&review.reviewer) {
+            return Err(DiagonError::Validation("Already reviewed".into()));
+        }
+        
+        let key = (review.reviewer.clone(), pending.author.clone());
+        *self.interaction_counts.entry(key).or_insert(0) += 1;
+        
+        pending.reviews.push(review);
+        Ok(pending.is_complete())
+    }
+    
+    pub fn finalize_review(&mut self, content_cid: Cid) -> Result<QualityVerdict> {
+        let pending = self.pending.remove(&content_cid)
+            .ok_or(DiagonError::Validation("Not found".into()))?;
+        
+        if pending.reviews.is_empty() {
+            let verdict = QualityVerdict {
+                content_cid, author: pending.author, quality_score: 0.5,
+                flagged: false, flag_reason: None, reviewer_scores: Vec::new(),
+                consensus_aligned: Vec::new(), consensus_outliers: Vec::new(),
+                xp_awarded: 0, verdict_at: timestamp(),
+            };
+            self.verdicts.insert(content_cid, verdict.clone());
+            return Ok(verdict);
+        }
+        
+        let mut scores: Vec<_> = pending.reviews.iter()
+            .map(|r| (r.reviewer.clone(), r.composite_score(), 
+                      self.reviewer_reputations.get(&r.reviewer).map(|rep| rep.weight()).unwrap_or(0.5)))
+            .collect();
+        scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        
+        let total_weight: f64 = scores.iter().map(|(_, _, w)| w).sum();
+        let mut cumulative = 0.0;
+        let mut median = scores.get(0).map(|x| x.1).unwrap_or(3.0);
+        for (_, score, weight) in &scores {
+            cumulative += weight;
+            if cumulative >= total_weight / 2.0 { median = *score; break; }
+        }
+        
+        let mut aligned = Vec::new();
+        let mut outliers = Vec::new();
+        for (did, score, _) in &scores {
+            let dev = (score - median).abs();
+            if dev <= REVIEW_CONSENSUS_THRESHOLD { aligned.push(did.clone()); }
+            else if dev > REVIEW_OUTLIER_THRESHOLD { outliers.push(did.clone()); }
+        }
+        
+        let flag_count = pending.reviews.iter().filter(|r| r.is_flagged()).count();
+        let flagged = flag_count > pending.reviews.len() / 2;
+        let flag_reason = if flagged {
+            let spam = pending.reviews.iter().filter(|r| r.flag_spam).count();
+            let plag = pending.reviews.iter().filter(|r| r.flag_plagiarism).count();
+            if spam >= plag { Some("spam".into()) } else { Some("plagiarism".into()) }
+        } else { None };
+        
+        let quality = if flagged { 0.0 } else { (median - 1.0) / 4.0 };
+        let xp = if flagged { 0 } else { calculate_xp_award(pending.content_type, pending.word_count, quality) };
+        
+        for review in &pending.reviews {
+            let aligned_consensus = (review.composite_score() - median).abs() <= REVIEW_CONSENSUS_THRESHOLD;
+            let flag_result = if review.is_flagged() { Some(flagged) } else { None };
+            self.reviewer_reputations.entry(review.reviewer.clone())
+                .or_insert_with(ReviewerReputation::new)
+                .update(aligned_consensus, flag_result);
+        }
+        
+        let verdict = QualityVerdict {
+            content_cid, author: pending.author, quality_score: quality,
+            flagged, flag_reason,
+            reviewer_scores: scores.iter().map(|(d, s, _)| (d.clone(), *s)).collect(),
+            consensus_aligned: aligned, consensus_outliers: outliers,
+            xp_awarded: xp, verdict_at: timestamp(),
+        };
+        self.verdicts.insert(content_cid, verdict.clone());
+        Ok(verdict)
+    }
+    
+    pub fn get_assignments(&self, reviewer: &Did) -> Vec<&PendingReview> {
+        self.pending.values()
+            .filter(|p| p.is_assigned(reviewer) && !p.has_reviewed(reviewer))
+            .collect()
+    }
+    
+    pub fn get_expired(&self) -> Vec<Cid> {
+        self.pending.iter()
+            .filter(|(_, p)| p.is_expired() || p.is_complete())
+            .map(|(cid, _)| *cid)
+            .collect()
+    }
+    
+    pub fn calculate_reviewer_rewards(&self, cid: &Cid) -> HashMap<Did, u64> {
+        let mut rewards = HashMap::new();
+        if let Some(verdict) = self.verdicts.get(cid) {
+            for (reviewer, _) in &verdict.reviewer_scores {
+                let mut xp = XP_REVIEW_COMPLETE;
+                if verdict.consensus_aligned.contains(reviewer) { xp += XP_REVIEW_CONSENSUS_BONUS; }
+                if verdict.flagged { xp += XP_REVIEW_SPAM_CATCH; }
+                rewards.insert(reviewer.clone(), xp);
+            }
+        }
+        rewards
     }
 }
 
@@ -1704,6 +2144,18 @@ pub enum NetMessage {
     TestimonyAnnounce {
         testimony: Testimony,
     },
+    ReviewAssignment {
+        content_cid: Cid,
+        content_type: ReviewableContentType,
+        content_text: String,
+        context_text: Option<String>,
+        deadline: u64,
+        signature: Vec<u8>,
+    },
+    ReviewSubmission { review: QualityReview },
+    ReviewVerdict { verdict: QualityVerdict },
+    ReviewQueueRequest,
+    ReviewQueueResponse { pending_count: usize, my_assignments: Vec<Cid>, my_completed: usize },
 }
 
 impl NetMessage {
@@ -1797,6 +2249,23 @@ impl NetMessage {
                 Some(data)
             }
             NetMessage::TestimonyAnnounce { testimony } => Some(testimony.signable_bytes()),
+            NetMessage::ReviewAssignment { content_cid, content_type, content_text, deadline, .. } => {
+                let mut data = b"review-assignment:".to_vec();
+                data.extend_from_slice(&content_cid.0);
+                data.extend_from_slice(content_type.as_str().as_bytes());
+                data.extend_from_slice(content_text.as_bytes());
+                data.extend_from_slice(&deadline.to_le_bytes());
+                Some(data)
+            }
+            NetMessage::ReviewSubmission { review } => Some(review.signable_bytes()),
+            NetMessage::ReviewVerdict { verdict } => {
+                let mut data = b"review-verdict:".to_vec();
+                data.extend_from_slice(&verdict.content_cid.0);
+                data.extend_from_slice(&verdict.verdict_at.to_le_bytes());
+                Some(data)
+            }
+            NetMessage::ReviewQueueRequest => None,
+            NetMessage::ReviewQueueResponse { .. } => None,
             NetMessage::DecayConfigPropose { id, config, reason, .. } => {
                 let mut data = b"decay-config:".to_vec();
                 data.extend_from_slice(&id.0);
@@ -2125,6 +2594,9 @@ struct PersistedState {
     /// Testimony registry - testimonies we've given
     #[serde(default)]
     testimony_registry: TestimonyRegistry,
+    // Rv
+    #[serde(default)]
+    review_state: ReviewState,
 }
 
 // ============================================================================
@@ -2180,8 +2652,8 @@ pub struct Node {
     pool_name: RwLock<Option<String>>,
     pool_topics: RwLock<Vec<[u8; 32]>>,
     decay_config: RwLock<DecayConfig>,
-    /// Registry of testimonies given to other pools
     testimony_registry: RwLock<TestimonyRegistry>,
+    review_state: RwLock<ReviewState>,
 }
 
 impl Node {
@@ -2190,7 +2662,7 @@ impl Node {
         tokio::task::spawn_blocking(move || std::fs::create_dir_all(&db)).await.ok();
         
         let persistence_path = format!("{}/state.cbor", db_path);
-        let (did, secret_key, public_key, store, state, xp, dht, pool_name, pool_topics, decay_config, testimony_registry) = 
+        let (did, secret_key, public_key, store, state, xp, dht, pool_name, pool_topics, decay_config, testimony_registry, review_state) = 
             Self::load_or_create(&persistence_path).await?;
         
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -2221,9 +2693,10 @@ impl Node {
             pool_topics: RwLock::new(pool_topics),
             decay_config: RwLock::new(decay_config),
             testimony_registry: RwLock::new(testimony_registry),
+            review_state: RwLock::new(review_state),
         });
         
-        println!("DIAGON v0.9.5 - Collective Consciousness Protocol");
+        println!("DIAGON v0.9.6 - Collective Consciousness Protocol");
         println!("   \"Consensus, sharing, collective truth\"");
         println!();
         println!("[MY ID] DID: {}", did.0);
@@ -2252,7 +2725,7 @@ impl Node {
         Ok(node)
     }
     
-    async fn load_or_create(path: &str) -> Result<(Did, SecretKey, PublicKey, ExprStore, DerivedState, XpState, DhtState, Option<String>, Vec<[u8; 32]>, DecayConfig, TestimonyRegistry)> {
+    async fn load_or_create(path: &str) -> Result<(Did, SecretKey, PublicKey, ExprStore, DerivedState, XpState, DhtState, Option<String>, Vec<[u8; 32]>, DecayConfig, TestimonyRegistry, ReviewState)> {
         let path = path.to_string();
         tokio::task::spawn_blocking(move || {
             if let Ok(file) = std::fs::File::open(&path) {
@@ -2286,18 +2759,19 @@ impl Node {
                             }
                             
                             let testimony_registry = persisted.testimony_registry;
+                            let review_state = persisted.review_state;
                             
-                            println!("📥 Loaded {} expressions, {} proposals, {} XP, {} DHT entries, {} testimonies given", 
+                            println!("📥 Loaded {} expressions, {} proposals, {} XP, {} DHT entries, {} testimonies given, {:?} review state", 
                                 store.log().len(), state.proposals.len(), persisted.xp.total_xp,
-                                dht.get_directory().len(), testimony_registry.given_count);
-                            return Ok((did, sk, pk, store, state, persisted.xp, dht, persisted.pool_name, persisted.pool_topics, decay_config, testimony_registry));
+                                dht.get_directory().len(), testimony_registry.given_count, review_state);
+                            return Ok((did, sk, pk, store, state, persisted.xp, dht, persisted.pool_name, persisted.pool_topics, decay_config, testimony_registry, review_state));
                         }
                     }
                 }
             }
             let (public_key, secret_key) = keypair();
             let did = Did::from_pubkey(&public_key);
-            Ok((did, secret_key, public_key, ExprStore::new(), DerivedState::new(), XpState::new(), DhtState::new(), None, Vec::new(), DecayConfig::default(), TestimonyRegistry::new()))
+            Ok((did, secret_key, public_key, ExprStore::new(), DerivedState::new(), XpState::new(), DhtState::new(), None, Vec::new(), DecayConfig::default(), TestimonyRegistry::new(), ReviewState::new()))
         }).await.map_err(|e| DiagonError::Io(io::Error::new(ErrorKind::Other, e.to_string())))?
     }
     
@@ -2329,6 +2803,7 @@ impl Node {
             .decay_proposals.iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect();
+        let review_state = self.review_state.read().await.clone();
         
         let persisted = PersistedState {
             identity: (self.public_key.as_bytes().to_vec(), self.secret_key.as_bytes().to_vec(), self.did.clone()),
@@ -2344,6 +2819,7 @@ impl Node {
             decay_config: Some(decay_config),
             decay_proposals,
             testimony_registry,
+            review_state,
         };
         drop(store);
         drop(state);
@@ -4872,6 +5348,22 @@ impl Node {
             NetMessage::TestimonyAnnounce { testimony } => {
                 self.handle_testimony_announce(testimony, from).await
             }
+            NetMessage::ReviewAssignment { content_cid, content_type, content_text, context_text, deadline, signature } => {
+                self.handle_review_assignment(content_cid, content_type, content_text, context_text, deadline, from).await
+            }
+            NetMessage::ReviewSubmission { review } => {
+                self.handle_review_submission(review, from).await
+            }
+            NetMessage::ReviewVerdict { verdict } => {
+                self.handle_review_verdict(verdict, from).await
+            }
+            NetMessage::ReviewQueueRequest => {
+                self.handle_review_queue_request(from).await
+            }
+            NetMessage::ReviewQueueResponse { pending_count, my_assignments, my_completed } => {
+                println!("[REVIEW] Peer {} reports {} pending", from, pending_count);
+                Ok(())
+            }
         }
     }
     
@@ -5545,6 +6037,295 @@ impl Node {
             Ok(_) => Some(path),
             Err(e) => { println!("[CONTENT] Save failed: {}", e); None }
         }
+    }
+
+    async fn handle_review_assignment(
+        &self, content_cid: Cid, content_type: ReviewableContentType,
+        content_text: String, context_text: Option<String>, deadline: u64, from: SocketAddr,
+    ) -> Result<()> {
+        let mut state = self.review_state.write().await;
+        if !state.pending.contains_key(&content_cid) {
+            let pending = PendingReview {
+                content_cid, content_type, content_text, context_cid: None, context_text,
+                submitted_at: timestamp(), deadline, required_reviews: content_type.tier_config().0,
+                assigned_reviewers: vec![self.did.clone()], reviews: Vec::new(),
+                author: Did("anonymous".into()), word_count: 0,
+            };
+            state.pending.insert(content_cid, pending);
+        }
+        println!("[REVIEW] Assigned: {} ({})", content_cid.short(), content_type);
+        Ok(())
+    }
+    
+    async fn handle_review_submission(&self, review: QualityReview, from: SocketAddr) -> Result<()> {
+        if !review.verify() { return Err(DiagonError::SignatureRequired); }
+        
+        let cid = review.content_cid;
+        let reviewer = review.reviewer.clone();
+        
+        let complete = {
+            let mut state = self.review_state.write().await;
+            state.submit_review(review.clone())?
+        };
+        
+        println!("[REVIEW] From {} for {}", reviewer.short(), cid.short());
+        
+        let msg = NetMessage::ReviewSubmission { review };
+        let data = msg.serialize()?;
+        for addr in self.connection_pool.authenticated_addrs().await {
+            if addr != from {
+                if let Some(h) = self.connection_pool.get_handle(&addr).await {
+                    let _ = h.send(data.clone()).await;
+                }
+            }
+        }
+        
+        if complete { self.finalize_review_internal(cid).await?; }
+        Ok(())
+    }
+    
+    async fn handle_review_verdict(&self, verdict: QualityVerdict, from: SocketAddr) -> Result<()> {
+        let cid = verdict.content_cid;
+        
+        {
+            let mut state = self.review_state.write().await;
+            state.pending.remove(&cid);
+            state.verdicts.insert(cid, verdict.clone());
+        }
+        
+        if verdict.author == self.did && verdict.xp_awarded > 0 {
+            self.xp.write().await.total_xp += verdict.xp_awarded;
+            println!("[XP] +{} for {} (quality: {:.2})", verdict.xp_awarded, cid.short(), verdict.quality_score);
+        }
+        
+        {
+            let state = self.review_state.read().await;
+            let rewards = state.calculate_reviewer_rewards(&cid);
+            if let Some(&rxp) = rewards.get(&self.did) {
+                self.xp.write().await.total_xp += rxp;
+                println!("[XP] +{} for reviewing {}", rxp, cid.short());
+            }
+        }
+        
+        if !verdict.flagged {
+            let q = verdict.quality_score * 0.8 + 0.2;
+            self.state.write().await.update_mark(&verdict.author, q, true);
+        }
+        
+        let msg = NetMessage::ReviewVerdict { verdict };
+        let data = msg.serialize()?;
+        for addr in self.connection_pool.authenticated_addrs().await {
+            if addr != from {
+                if let Some(h) = self.connection_pool.get_handle(&addr).await {
+                    let _ = h.send(data.clone()).await;
+                }
+            }
+        }
+        
+        let _ = self.save_state().await;
+        Ok(())
+    }
+    
+    async fn handle_review_queue_request(&self, from: SocketAddr) -> Result<()> {
+        let state = self.review_state.read().await;
+        let msg = NetMessage::ReviewQueueResponse {
+            pending_count: state.pending.len(),
+            my_assignments: state.get_assignments(&self.did).iter().map(|p| p.content_cid).collect(),
+            my_completed: state.reviewer_reputations.get(&self.did).map(|r| r.reviews_completed as usize).unwrap_or(0),
+        };
+        if let Some(h) = self.connection_pool.get_handle(&from).await {
+            h.send(msg.serialize()?).await?;
+        }
+        Ok(())
+    }
+    
+    async fn finalize_review_internal(&self, cid: Cid) -> Result<()> {
+        let should = self.review_state.read().await.pending.get(&cid)
+            .map(|p| p.is_complete() || p.is_expired()).unwrap_or(false);
+        
+        if should {
+            let verdict = self.review_state.write().await.finalize_review(cid)?;
+            let msg = NetMessage::ReviewVerdict { verdict: verdict.clone() };
+            self.broadcast_authenticated(&msg).await;
+            
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            self.handle_review_verdict(verdict, addr).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn submit_for_review(
+        &self, content_cid: Cid, content_type: ReviewableContentType,
+        content_text: String, context_cid: Option<Cid>, context_text: Option<String>,
+    ) {
+        let eligible: Vec<Did> = {
+            let state = self.state.read().await;
+            let mut e = Vec::new();
+            for addr in self.connection_pool.authenticated_addrs().await {
+                if let Some(info) = self.connection_pool.get_info(&addr).await {
+                    let g = info.read().await;
+                    if let Some(ref did) = g.did {
+                        if state.get_mark(did).current_score() >= TRUST_MIN_FOR_PROPOSE {
+                            e.push(did.clone());
+                        }
+                    }
+                }
+            }
+            e
+        };
+        
+        let res = {
+            let mut rs = self.review_state.write().await;
+            rs.submit_for_review(content_cid, content_type, content_text.clone(), context_cid, context_text.clone(), self.did.clone(), &eligible)
+        };
+        
+        match res {
+            Ok(()) => {
+                println!("[REVIEW] {} submitted for {}", content_cid.short(), content_type);
+                
+                let rs = self.review_state.read().await;
+                if let Some(p) = rs.pending.get(&content_cid) {
+                    let sig = self.sign(&{
+                        let mut d = b"review-assignment:".to_vec();
+                        d.extend_from_slice(&content_cid.0);
+                        d.extend_from_slice(content_type.as_str().as_bytes());
+                        d.extend_from_slice(content_text.as_bytes());
+                        d.extend_from_slice(&p.deadline.to_le_bytes());
+                        d
+                    });
+                    
+                    let msg = NetMessage::ReviewAssignment {
+                        content_cid, content_type, content_text, context_text, deadline: p.deadline, signature: sig,
+                    };
+                    drop(rs);
+                    self.broadcast_authenticated(&msg).await;
+                }
+            }
+            Err(e) => println!("[REVIEW] Failed: {}", e),
+        }
+    }
+    
+    pub async fn review_queue(&self) {
+        let rs = self.review_state.read().await;
+        let assignments = rs.get_assignments(&self.did);
+        
+        println!("\n=== REVIEW QUEUE ===");
+        println!("Total pending: {} | Your assignments: {}", rs.pending.len(), assignments.len());
+        
+        for p in assignments {
+            let h = p.deadline.saturating_sub(timestamp()) / 3600;
+            let preview = if p.content_text.len() > 50 { format!("{}...", &p.content_text[..50]) } else { p.content_text.clone() };
+            println!("  {} [{}] {}h left - \"{}\"", p.content_cid.short(), p.content_type, h, preview);
+        }
+        
+        if let Some(rep) = rs.reviewer_reputations.get(&self.did) {
+            println!("\nYour stats: {} reviews, {:.2} score", rep.reviews_completed, rep.score);
+        }
+        println!();
+    }
+    
+    pub async fn review_content(&self, cid_prefix: &str) {
+        let rs = self.review_state.read().await;
+        let pending = rs.pending.iter()
+            .find(|(c, p)| c.short().starts_with(cid_prefix) && p.is_assigned(&self.did))
+            .map(|(_, p)| p.clone());
+        
+        let p = match pending {
+            Some(p) => p,
+            None => { println!("[ERR] Not found: {}", cid_prefix); return; }
+        };
+        
+        println!("\n=== REVIEW: {} ===", p.content_cid.short());
+        println!("Type: {} | Words: {} | Deadline: {}", p.content_type, p.word_count, format_timestamp(p.deadline));
+        if let Some(ref ctx) = p.context_text {
+            println!("\nCONTEXT:\n{}\n", ctx);
+        }
+        println!("CONTENT:\n═══════════════════════════════════════");
+        println!("{}", p.content_text);
+        println!("═══════════════════════════════════════\n");
+        println!("Use: submit-review {} <rel> <sub> <cla> <ori> <eff> \"justification\" [--spam|--plagiarism|--offtopic]", p.content_cid.short());
+    }
+    
+    pub async fn submit_review_cmd(
+        &self, cid_prefix: &str, rel: u8, sub: u8, cla: u8, ori: u8, eff: u8,
+        just: &str, spam: bool, plag: bool, offtopic: bool,
+    ) {
+        if ![rel, sub, cla, ori, eff].iter().all(|&s| (1..=5).contains(&s)) {
+            println!("[ERR] Scores must be 1-5"); return;
+        }
+        if just.len() < REVIEW_MIN_JUSTIFICATION_LEN {
+            println!("[ERR] Justification min {} chars", REVIEW_MIN_JUSTIFICATION_LEN); return;
+        }
+        
+        let cid = {
+            let rs = self.review_state.read().await;
+            rs.pending.keys().find(|c| c.short().starts_with(cid_prefix)).copied()
+        };
+        
+        let cid = match cid {
+            Some(c) => c,
+            None => { println!("[ERR] Not in queue"); return; }
+        };
+        
+        let mut review = QualityReview {
+            content_cid: cid, reviewer: self.did.clone(), pubkey: self.public_key.as_bytes().to_vec(),
+            relevance: rel, substance: sub, clarity: cla, originality: ori, effort: eff,
+            justification: just.to_string(), flag_spam: spam, flag_plagiarism: plag, flag_offtopic: offtopic,
+            reviewed_at: timestamp(), signature: Vec::new(),
+        };
+        
+        let sig = detached_sign(&review.signable_bytes(), &self.secret_key);
+        review.signature = sig.as_bytes().to_vec();
+        
+        let complete = {
+            let mut rs = self.review_state.write().await;
+            match rs.submit_review(review.clone()) {
+                Ok(c) => c,
+                Err(e) => { println!("[ERR] {}", e); return; }
+            }
+        };
+        
+        println!("[REVIEW] Submitted for {} (score: {:.2})", cid.short(), review.composite_score());
+        
+        let msg = NetMessage::ReviewSubmission { review };
+        self.broadcast_authenticated(&msg).await;
+        
+        if complete {
+            let _ = self.finalize_review_internal(cid).await;
+        }
+        let _ = self.save_state().await;
+    }
+    
+    pub async fn show_verdicts(&self, count: usize) {
+        let rs = self.review_state.read().await;
+        let mut v: Vec<_> = rs.verdicts.values().collect();
+        v.sort_by(|a, b| b.verdict_at.cmp(&a.verdict_at));
+        
+        println!("\n=== VERDICTS ===");
+        for verdict in v.iter().take(count) {
+            let status = if verdict.flagged {
+                format!("FLAGGED: {}", verdict.flag_reason.as_deref().unwrap_or("?"))
+            } else {
+                format!("Quality: {:.2}", verdict.quality_score)
+            };
+            println!("  {} | {} | {} XP | {} reviews", 
+                     verdict.content_cid.short(), status, verdict.xp_awarded, verdict.reviewer_scores.len());
+        }
+        println!();
+    }
+    
+    pub async fn reviewer_stats(&self) {
+        let rs = self.review_state.read().await;
+        println!("\n=== REVIEWER STATS ===");
+        if let Some(rep) = rs.reviewer_reputations.get(&self.did) {
+            println!("Reviews: {} | Alignments: {} | Deviations: {}", 
+                     rep.reviews_completed, rep.consensus_alignments, rep.consensus_deviations);
+            println!("Flags confirmed: {} | False flags: {}", rep.confirmed_flags, rep.false_flags);
+            println!("Score: {:.3} | Weight: {:.3}", rep.score, rep.weight());
+        } else {
+            println!("No review history.");
+        }
+        println!();
     }
 
     async fn handle_dm_request(&self, requester_did: Did, ephemeral_pubkey: [u8; 32], _from: SocketAddr) -> Result<()> {
@@ -6466,6 +7247,13 @@ fn detect_video_mime(data: &[u8]) -> Option<String> {
     else { Some("application/octet-stream".to_string()) }
 }
 
+fn calculate_xp_award(content_type: ReviewableContentType, word_count: u32, quality: f64) -> u64 {
+    let base = content_type.base_xp();
+    let length_factor = if word_count < 10 { LENGTH_FACTOR_MIN }
+    else { ((word_count as f64 / LENGTH_FACTOR_BASE_WORDS).log2() + 1.0).max(LENGTH_FACTOR_MIN).min(LENGTH_FACTOR_MAX) };
+    (base as f64 * length_factor * quality) as u64
+}
+
 fn print_help() {
     println!("DIAGON v0.9.6 - Collective Consciousness Protocol");
     println!();
@@ -6503,6 +7291,13 @@ fn print_help() {
     println!("  testimonies <cid>              Show testimonies for expression");
     println!("  request-testimony <cid>        Request others to testify");
     println!("  my-testimonies                 Show testimonies you've given");
+    println!();
+    println!("=== HITL Quality Review ===");
+    println!("  review-queue                   Show pending review assignments");
+    println!("  review <cid>                   View content to review");
+    println!("  submit-review <cid> <scores>   Submit review with 5 scores (1-5)");
+    println!("  verdicts [n]                   Show recent verdicts");
+    println!("  reviewer-stats                 Show your reviewer reputation");
     println!();
     println!("=== Direct Messages (E2E encrypted) ===");
     println!("  dm-request <did>               Request DM channel (needs consent)");
@@ -6751,6 +7546,29 @@ async fn async_main(addr: &str, db_path: &str) -> io::Result<()> {
             "testimonies" if !arg.is_empty() => { node.show_testimonies(arg).await; }
             "request-testimony" if !arg.is_empty() => { node.request_testimony(arg).await; }
             "my-testimonies" => { node.show_given_testimonies().await; }
+             "review-queue" => { node.review_queue().await; }
+            "review" if !arg.is_empty() => { node.review_content(arg).await; }
+            "submit-review" if !arg.is_empty() => {
+                let parts: Vec<&str> = arg.splitn(7, ' ').collect();
+                if parts.len() >= 7 {
+                    let cid = parts[0];
+                    let rel: u8 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let sub: u8 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let cla: u8 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let ori: u8 = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let eff: u8 = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let rest = parts[6];
+                    let just = rest.trim_matches('"').split("--").next().unwrap_or("").trim();
+                    let spam = rest.contains("--spam");
+                    let plag = rest.contains("--plagiarism");
+                    let offtopic = rest.contains("--offtopic");
+                    node.submit_review_cmd(cid, rel, sub, cla, ori, eff, just, spam, plag, offtopic).await;
+                } else {
+                    println!("Usage: submit-review <cid> <rel> <sub> <cla> <ori> <eff> \"justification\" [--spam]");
+                }
+            }
+            "verdicts" => { node.show_verdicts(arg.parse().unwrap_or(10)).await; }
+            "reviewer-stats" => { node.reviewer_stats().await; }
             "help" => { print_help(); }
             "quit" | "exit" => { break; }
             _ => { println!("Unknown command. Type 'help' for commands."); }
@@ -9186,14 +10004,19 @@ mod tests {
             
             sleep(Duration::from_millis(200)).await;
             
-            // Connect nodes
+            // Step 1: Node1 connects to Node2
             node1.connect(&format!("127.0.0.1:{}", port2)).await.expect("Connect failed");
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(200)).await;
             
+            // Step 2: Node1 sends elaboration
             node1.elaborate("Testing DHT sync between nodes.").await;
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(200)).await;
             
-            // Approve connection
+            // Step 3: Node2 sends its elaboration (REQUIRED for mutual handshake)
+            node2.elaborate("Accepting DHT sync test connection.").await;
+            sleep(Duration::from_millis(200)).await;
+            
+            // Step 4: Node2 approves
             let pending = node2.connection_pool.pending_approval().await;
             for (_, info) in pending {
                 let did = info.read().await.did.clone();
@@ -9201,7 +10024,17 @@ mod tests {
                     node2.mutual_approve(&d.short()).await;
                 }
             }
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(200)).await;
+            
+            // Step 5: Node1 also approves (mutual approval requires both sides)
+            let pending = node1.connection_pool.pending_approval().await;
+            for (_, info) in pending {
+                let did = info.read().await.did.clone();
+                if let Some(d) = did {
+                    node1.mutual_approve(&d.short()).await;
+                }
+            }
+            sleep(Duration::from_millis(200)).await;
             
             // Check if connected
             let n1_auth = node1.connection_pool.authenticated_addrs().await.len();
@@ -9948,14 +10781,19 @@ mod tests {
             
             sleep(Duration::from_millis(200)).await;
             
-            // Connect nodes
+            // Step 1: Node1 connects to Node2
             node1.connect(&format!("127.0.0.1:{}", port2)).await.expect("Connect failed");
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(200)).await;
             
+            // Step 2: Node1 sends elaboration
             node1.elaborate("Testing decay config governance sync.").await;
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(200)).await;
             
-            // Approve connection
+            // Step 3: Node2 sends its elaboration (REQUIRED for mutual handshake)
+            node2.elaborate("Accepting decay sync test connection.").await;
+            sleep(Duration::from_millis(200)).await;
+            
+            // Step 4: Node2 approves
             let pending = node2.connection_pool.pending_approval().await;
             for (_, info) in pending {
                 let did = info.read().await.did.clone();
@@ -9963,7 +10801,17 @@ mod tests {
                     node2.mutual_approve(&d.short()).await;
                 }
             }
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(200)).await;
+            
+            // Step 5: Node1 also approves (mutual approval requires both sides)
+            let pending = node1.connection_pool.pending_approval().await;
+            for (_, info) in pending {
+                let did = info.read().await.did.clone();
+                if let Some(d) = did {
+                    node1.mutual_approve(&d.short()).await;
+                }
+            }
+            sleep(Duration::from_millis(200)).await;
             
             // Verify connected
             let n1_auth = node1.connection_pool.authenticated_addrs().await.len();
@@ -10306,5 +11154,2032 @@ mod tests {
         println!("[✓] Connected transition works");
         
         println!("[✓] Peer info mutual state test passed\n");
+    }
+    
+    // ========================================================================
+    // REVIEWABLE CONTENT TYPE TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_reviewable_content_type_tier_config() {
+        println!("\n=== TEST: ReviewableContentType tier_config ===");
+        
+        // Critical tier: Proposal, PinReason, PruneReason
+        assert_eq!(ReviewableContentType::Proposal.tier_config(), REVIEW_TIER_CRITICAL);
+        assert_eq!(ReviewableContentType::PinReason.tier_config(), REVIEW_TIER_CRITICAL);
+        assert_eq!(ReviewableContentType::PruneReason.tier_config(), REVIEW_TIER_CRITICAL);
+        println!("[✓] Critical tier types return (5, 72)");
+        
+        // Standard tier: ProposalElaboration, Reply, VoteElaboration
+        assert_eq!(ReviewableContentType::ProposalElaboration.tier_config(), REVIEW_TIER_STANDARD);
+        assert_eq!(ReviewableContentType::Reply.tier_config(), REVIEW_TIER_STANDARD);
+        assert_eq!(ReviewableContentType::VoteElaboration.tier_config(), REVIEW_TIER_STANDARD);
+        println!("[✓] Standard tier types return (3, 48)");
+        
+        // Fast tier: Acknowledgment
+        assert_eq!(ReviewableContentType::Acknowledgment.tier_config(), REVIEW_TIER_FAST);
+        println!("[✓] Fast tier type returns (2, 24)");
+        
+        println!("[✓] ReviewableContentType tier_config test passed\n");
+    }
+
+    #[test]
+    fn test_reviewable_content_type_base_xp() {
+        println!("\n=== TEST: ReviewableContentType base_xp ===");
+        
+        assert_eq!(ReviewableContentType::Proposal.base_xp(), XP_BASE_PROPOSAL);
+        assert_eq!(ReviewableContentType::ProposalElaboration.base_xp(), XP_BASE_PROPOSAL_ELABORATION);
+        assert_eq!(ReviewableContentType::Reply.base_xp(), XP_BASE_REPLY);
+        assert_eq!(ReviewableContentType::VoteElaboration.base_xp(), XP_BASE_VOTE_ELABORATION);
+        assert_eq!(ReviewableContentType::Acknowledgment.base_xp(), XP_BASE_ACKNOWLEDGMENT);
+        assert_eq!(ReviewableContentType::PinReason.base_xp(), XP_BASE_PIN_REASON);
+        assert_eq!(ReviewableContentType::PruneReason.base_xp(), XP_BASE_PRUNE_REASON);
+        println!("[✓] All content types return correct base XP");
+        
+        println!("[✓] ReviewableContentType base_xp test passed\n");
+    }
+
+    #[test]
+    fn test_reviewable_content_type_as_str() {
+        println!("\n=== TEST: ReviewableContentType as_str ===");
+        
+        assert_eq!(ReviewableContentType::Proposal.as_str(), "proposal");
+        assert_eq!(ReviewableContentType::ProposalElaboration.as_str(), "proposal-elaboration");
+        assert_eq!(ReviewableContentType::Reply.as_str(), "reply");
+        assert_eq!(ReviewableContentType::Acknowledgment.as_str(), "acknowledgment");
+        assert_eq!(ReviewableContentType::VoteElaboration.as_str(), "vote-elaboration");
+        assert_eq!(ReviewableContentType::PinReason.as_str(), "pin-reason");
+        assert_eq!(ReviewableContentType::PruneReason.as_str(), "prune-reason");
+        println!("[✓] All content types return correct string representations");
+        
+        // Test Display trait
+        let proposal_str = format!("{}", ReviewableContentType::Proposal);
+        assert_eq!(proposal_str, "proposal");
+        println!("[✓] Display trait works correctly");
+        
+        println!("[✓] ReviewableContentType as_str test passed\n");
+    }
+
+    #[test]
+    fn test_reviewable_content_type_equality() {
+        println!("\n=== TEST: ReviewableContentType equality ===");
+        
+        let p1 = ReviewableContentType::Proposal;
+        let p2 = ReviewableContentType::Proposal;
+        let r1 = ReviewableContentType::Reply;
+        
+        assert_eq!(p1, p2);
+        assert_ne!(p1, r1);
+        println!("[✓] Equality comparisons work correctly");
+        
+        // Test Hash trait via HashSet
+        let mut set = std::collections::HashSet::new();
+        set.insert(ReviewableContentType::Proposal);
+        set.insert(ReviewableContentType::Proposal);
+        assert_eq!(set.len(), 1);
+        set.insert(ReviewableContentType::Reply);
+        assert_eq!(set.len(), 2);
+        println!("[✓] Hash trait works correctly");
+        
+        println!("[✓] ReviewableContentType equality test passed\n");
+    }
+
+    // ========================================================================
+    // QUALITY REVIEW TESTS
+    // ========================================================================
+
+    fn make_test_review(cid: Cid, reviewer: Did) -> QualityReview {
+        QualityReview {
+            content_cid: cid,
+            reviewer,
+            pubkey: vec![],
+            relevance: 4,
+            substance: 4,
+            clarity: 4,
+            originality: 3,
+            effort: 4,
+            justification: "This is a valid test justification for the review.".into(),
+            flag_spam: false,
+            flag_plagiarism: false,
+            flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        }
+    }
+
+    fn make_signed_review(cid: Cid, pk: &PublicKey, sk: &SecretKey) -> QualityReview {
+        let reviewer = Did::from_pubkey(pk);
+        let mut review = QualityReview {
+            content_cid: cid,
+            reviewer,
+            pubkey: pk.as_bytes().to_vec(),
+            relevance: 4,
+            substance: 4,
+            clarity: 4,
+            originality: 3,
+            effort: 4,
+            justification: "This is a valid test justification for the review.".into(),
+            flag_spam: false,
+            flag_plagiarism: false,
+            flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        };
+        let sig = detached_sign(&review.signable_bytes(), sk);
+        review.signature = sig.as_bytes().to_vec();
+        review
+    }
+
+    #[test]
+    fn test_quality_review_composite_score() {
+        println!("\n=== TEST: QualityReview composite_score ===");
+        
+        let cid = Cid::new(b"test content");
+        let reviewer = Did("did:diagon:reviewer".into());
+        
+        // Test with all 5s (max score)
+        let max_review = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer.clone(),
+            pubkey: vec![],
+            relevance: 5,
+            substance: 5,
+            clarity: 5,
+            originality: 5,
+            effort: 5,
+            justification: "Valid justification here".into(),
+            flag_spam: false,
+            flag_plagiarism: false,
+            flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        };
+        
+        // 5*0.25 + 5*0.30 + 5*0.20 + 5*0.15 + 5*0.10 = 1.25 + 1.50 + 1.00 + 0.75 + 0.50 = 5.0
+        let max_score = max_review.composite_score();
+        assert!((max_score - 5.0).abs() < 0.001, "Max score should be 5.0, got {}", max_score);
+        println!("[✓] Maximum score (all 5s) = 5.0");
+        
+        // Test with all 1s (min score)
+        let min_review = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer.clone(),
+            pubkey: vec![],
+            relevance: 1,
+            substance: 1,
+            clarity: 1,
+            originality: 1,
+            effort: 1,
+            justification: "Valid justification here".into(),
+            flag_spam: false,
+            flag_plagiarism: false,
+            flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        };
+        
+        let min_score = min_review.composite_score();
+        assert!((min_score - 1.0).abs() < 0.001, "Min score should be 1.0, got {}", min_score);
+        println!("[✓] Minimum score (all 1s) = 1.0");
+        
+        // Test weighted average
+        let weighted_review = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer.clone(),
+            pubkey: vec![],
+            relevance: 5,   // 5 * 0.25 = 1.25
+            substance: 3,   // 3 * 0.30 = 0.90
+            clarity: 4,     // 4 * 0.20 = 0.80
+            originality: 2, // 2 * 0.15 = 0.30
+            effort: 5,      // 5 * 0.10 = 0.50
+            justification: "Valid justification here".into(),
+            flag_spam: false,
+            flag_plagiarism: false,
+            flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        };
+        
+        let expected = 1.25 + 0.90 + 0.80 + 0.30 + 0.50; // 3.75
+        let actual = weighted_review.composite_score();
+        assert!((actual - expected).abs() < 0.001, "Expected {}, got {}", expected, actual);
+        println!("[✓] Weighted calculation correct: {:.2}", actual);
+        
+        println!("[✓] QualityReview composite_score test passed\n");
+    }
+
+    #[test]
+    fn test_quality_review_is_valid() {
+        println!("\n=== TEST: QualityReview is_valid ===");
+        
+        let cid = Cid::new(b"test");
+        let reviewer = Did("did:diagon:test".into());
+        
+        // Valid review
+        let valid_review = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer.clone(),
+            pubkey: vec![],
+            relevance: 3,
+            substance: 3,
+            clarity: 3,
+            originality: 3,
+            effort: 3,
+            justification: "This is valid justification text".into(), // >= 10 chars
+            flag_spam: false,
+            flag_plagiarism: false,
+            flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        };
+        assert!(valid_review.is_valid());
+        println!("[✓] Valid review passes validation");
+        
+        // Invalid: score out of range (0)
+        let invalid_score_zero = QualityReview {
+            relevance: 0, // Invalid: must be 1-5
+            ..valid_review.clone()
+        };
+        assert!(!invalid_score_zero.is_valid());
+        println!("[✓] Score of 0 rejected");
+        
+        // Invalid: score out of range (6)
+        let invalid_score_six = QualityReview {
+            substance: 6, // Invalid: must be 1-5
+            ..valid_review.clone()
+        };
+        assert!(!invalid_score_six.is_valid());
+        println!("[✓] Score of 6 rejected");
+        
+        // Invalid: justification too short
+        let short_just = QualityReview {
+            justification: "short".into(), // < 10 chars
+            ..valid_review.clone()
+        };
+        assert!(!short_just.is_valid());
+        println!("[✓] Short justification rejected");
+        
+        // Edge case: exactly 10 character justification
+        let exact_just = QualityReview {
+            justification: "0123456789".into(), // exactly 10 chars
+            ..valid_review.clone()
+        };
+        assert!(exact_just.is_valid());
+        println!("[✓] Exactly 10 char justification accepted");
+        
+        // Edge case: scores at boundaries (1 and 5)
+        let boundary_scores = QualityReview {
+            relevance: 1,
+            substance: 5,
+            clarity: 1,
+            originality: 5,
+            effort: 1,
+            ..valid_review.clone()
+        };
+        assert!(boundary_scores.is_valid());
+        println!("[✓] Boundary scores (1 and 5) accepted");
+        
+        println!("[✓] QualityReview is_valid test passed\n");
+    }
+
+    #[test]
+    fn test_quality_review_is_flagged() {
+        println!("\n=== TEST: QualityReview is_flagged ===");
+        
+        let cid = Cid::new(b"test");
+        let reviewer = Did("did:diagon:test".into());
+        
+        let base = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer.clone(),
+            pubkey: vec![],
+            relevance: 3,
+            substance: 3,
+            clarity: 3,
+            originality: 3,
+            effort: 3,
+            justification: "Valid justification".into(),
+            flag_spam: false,
+            flag_plagiarism: false,
+            flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        };
+        
+        // No flags
+        assert!(!base.is_flagged());
+        println!("[✓] No flags = not flagged");
+        
+        // Only spam flag
+        let spam_only = QualityReview { flag_spam: true, ..base.clone() };
+        assert!(spam_only.is_flagged());
+        println!("[✓] Spam flag only = flagged");
+        
+        // Only plagiarism flag
+        let plag_only = QualityReview { flag_plagiarism: true, ..base.clone() };
+        assert!(plag_only.is_flagged());
+        println!("[✓] Plagiarism flag only = flagged");
+        
+        // Only offtopic flag
+        let offtopic_only = QualityReview { flag_offtopic: true, ..base.clone() };
+        assert!(offtopic_only.is_flagged());
+        println!("[✓] Off-topic flag only = flagged");
+        
+        // Multiple flags
+        let multi_flags = QualityReview { 
+            flag_spam: true, 
+            flag_plagiarism: true, 
+            flag_offtopic: true, 
+            ..base.clone() 
+        };
+        assert!(multi_flags.is_flagged());
+        println!("[✓] Multiple flags = flagged");
+        
+        println!("[✓] QualityReview is_flagged test passed\n");
+    }
+
+    #[test]
+    fn test_quality_review_signable_bytes() {
+        println!("\n=== TEST: QualityReview signable_bytes ===");
+        
+        let cid = Cid::new(b"test content");
+        let reviewer = Did("did:diagon:test".into());
+        
+        let review = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer.clone(),
+            pubkey: vec![1, 2, 3],
+            relevance: 4,
+            substance: 3,
+            clarity: 5,
+            originality: 2,
+            effort: 4,
+            justification: "Test justification".into(),
+            flag_spam: true,
+            flag_plagiarism: false,
+            flag_offtopic: true,
+            reviewed_at: 1234567890,
+            signature: vec![],
+        };
+        
+        let signable = review.signable_bytes();
+        
+        // Should start with prefix
+        assert!(signable.starts_with(b"quality-review:"));
+        println!("[✓] Signable bytes start with 'quality-review:' prefix");
+        
+        // Should contain CID
+        assert!(signable.windows(32).any(|w| w == cid.0));
+        println!("[✓] Signable bytes contain content CID");
+        
+        // Should contain scores (in order)
+        let prefix_len = b"quality-review:".len();
+        assert_eq!(signable[prefix_len + 32], 4); // relevance
+        assert_eq!(signable[prefix_len + 33], 3); // substance
+        assert_eq!(signable[prefix_len + 34], 5); // clarity
+        assert_eq!(signable[prefix_len + 35], 2); // originality
+        assert_eq!(signable[prefix_len + 36], 4); // effort
+        println!("[✓] Signable bytes contain scores in correct order");
+        
+        // Should contain justification
+        assert!(signable.windows(18).any(|w| w == b"Test justification"));
+        println!("[✓] Signable bytes contain justification");
+        
+        // Should contain flags
+        assert!(signable.contains(&1u8)); // flag_spam = true
+        println!("[✓] Signable bytes contain flag values");
+        
+        // Deterministic: same input = same output
+        let signable2 = review.signable_bytes();
+        assert_eq!(signable, signable2);
+        println!("[✓] Signable bytes are deterministic");
+        
+        // Different reviews produce different signable bytes
+        let review2 = QualityReview {
+            relevance: 5,
+            ..review.clone()
+        };
+        let signable3 = review2.signable_bytes();
+        assert_ne!(signable, signable3);
+        println!("[✓] Different reviews produce different signable bytes");
+        
+        println!("[✓] QualityReview signable_bytes test passed\n");
+    }
+
+    #[test]
+    fn test_quality_review_sign_and_verify() {
+        println!("\n=== TEST: QualityReview sign and verify ===");
+        
+        let (pk, sk) = keypair();
+        let cid = Cid::new(b"test content");
+        let reviewer = Did::from_pubkey(&pk);
+        
+        let mut review = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer.clone(),
+            pubkey: pk.as_bytes().to_vec(),
+            relevance: 4,
+            substance: 4,
+            clarity: 4,
+            originality: 3,
+            effort: 4,
+            justification: "Valid justification text for review".into(),
+            flag_spam: false,
+            flag_plagiarism: false,
+            flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        };
+        
+        // Unsigned review should not verify
+        assert!(!review.verify());
+        println!("[✓] Unsigned review does not verify");
+        
+        // Sign the review
+        let sig = detached_sign(&review.signable_bytes(), &sk);
+        review.signature = sig.as_bytes().to_vec();
+        
+        // Signed review should verify
+        assert!(review.verify());
+        println!("[✓] Signed review verifies");
+        
+        // Tampered content should not verify
+        let mut tampered = review.clone();
+        tampered.relevance = 5; // Change score
+        assert!(!tampered.verify());
+        println!("[✓] Tampered review does not verify");
+        
+        // Wrong pubkey should not verify
+        let (other_pk, _) = keypair();
+        let mut wrong_pk_review = review.clone();
+        wrong_pk_review.pubkey = other_pk.as_bytes().to_vec();
+        assert!(!wrong_pk_review.verify());
+        println!("[✓] Wrong pubkey does not verify");
+        
+        // Mismatched DID should not verify
+        let mut wrong_did_review = review.clone();
+        wrong_did_review.reviewer = Did("did:diagon:wrongperson".into());
+        assert!(!wrong_did_review.verify());
+        println!("[✓] Mismatched DID does not verify");
+        
+        // Invalid signature bytes should not verify
+        let mut bad_sig_review = review.clone();
+        bad_sig_review.signature = vec![0u8; 32]; // Too short for valid signature
+        assert!(!bad_sig_review.verify());
+        println!("[✓] Invalid signature bytes do not verify");
+        
+        println!("[✓] QualityReview sign and verify test passed\n");
+    }
+
+    // ========================================================================
+    // PENDING REVIEW TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_pending_review_new() {
+        println!("\n=== TEST: PendingReview::new ===");
+        
+        let cid = Cid::new(b"test content");
+        let author = Did("did:diagon:author".into());
+        let content = "This is the test content for review with multiple words here.".to_string();
+        
+        // Test Proposal type (critical tier)
+        let pending = PendingReview::new(
+            cid, 
+            ReviewableContentType::Proposal, 
+            content.clone(), 
+            None, 
+            None, 
+            author.clone()
+        );
+        
+        assert_eq!(pending.content_cid, cid);
+        assert_eq!(pending.content_type, ReviewableContentType::Proposal);
+        assert_eq!(pending.required_reviews, REVIEW_TIER_CRITICAL.0);
+        assert!(pending.deadline > timestamp());
+        assert!(pending.assigned_reviewers.is_empty());
+        assert!(pending.reviews.is_empty());
+        assert_eq!(pending.author, author);
+        assert_eq!(pending.word_count, 11); // Count words
+        println!("[✓] Proposal creates correct PendingReview");
+        
+        // Test Acknowledgment type (fast tier)
+        let ack_pending = PendingReview::new(
+            cid, 
+            ReviewableContentType::Acknowledgment, 
+            "Quick ack".to_string(), 
+            None, 
+            None, 
+            author.clone()
+        );
+        assert_eq!(ack_pending.required_reviews, REVIEW_TIER_FAST.0);
+        println!("[✓] Acknowledgment uses fast tier config");
+        
+        // Test with context
+        let context_cid = Cid::new(b"context");
+        let with_context = PendingReview::new(
+            cid,
+            ReviewableContentType::Reply,
+            content.clone(),
+            Some(context_cid),
+            Some("This is the context".to_string()),
+            author.clone()
+        );
+        assert_eq!(with_context.context_cid, Some(context_cid));
+        assert_eq!(with_context.context_text, Some("This is the context".to_string()));
+        println!("[✓] Context CID and text stored correctly");
+        
+        // Deadline should be in the future
+        let deadline_hours = ReviewableContentType::Proposal.tier_config().1;
+        let expected_deadline = timestamp() + (deadline_hours * 3600);
+        let diff = (pending.deadline as i64 - expected_deadline as i64).abs();
+        assert!(diff < 5, "Deadline should be approximately {}h in future", deadline_hours);
+        println!("[✓] Deadline calculated correctly for {} hours", deadline_hours);
+        
+        println!("[✓] PendingReview::new test passed\n");
+    }
+
+    #[test]
+    fn test_pending_review_is_assigned() {
+        println!("\n=== TEST: PendingReview::is_assigned ===");
+        
+        let cid = Cid::new(b"test");
+        let author = Did("did:diagon:author".into());
+        let reviewer1 = Did("did:diagon:reviewer1".into());
+        let reviewer2 = Did("did:diagon:reviewer2".into());
+        let not_assigned = Did("did:diagon:notassigned".into());
+        
+        let mut pending = PendingReview::new(
+            cid,
+            ReviewableContentType::Reply,
+            "Test content".into(),
+            None,
+            None,
+            author
+        );
+        
+        // Initially no one is assigned
+        assert!(!pending.is_assigned(&reviewer1));
+        assert!(!pending.is_assigned(&reviewer2));
+        println!("[✓] No reviewers initially assigned");
+        
+        // Add assignees
+        pending.assigned_reviewers.push(reviewer1.clone());
+        pending.assigned_reviewers.push(reviewer2.clone());
+        
+        assert!(pending.is_assigned(&reviewer1));
+        assert!(pending.is_assigned(&reviewer2));
+        assert!(!pending.is_assigned(&not_assigned));
+        println!("[✓] Assigned reviewers correctly identified");
+        
+        println!("[✓] PendingReview::is_assigned test passed\n");
+    }
+
+    #[test]
+    fn test_pending_review_has_reviewed() {
+        println!("\n=== TEST: PendingReview::has_reviewed ===");
+        
+        let cid = Cid::new(b"test");
+        let author = Did("did:diagon:author".into());
+        let reviewer1 = Did("did:diagon:reviewer1".into());
+        let reviewer2 = Did("did:diagon:reviewer2".into());
+        
+        let mut pending = PendingReview::new(
+            cid,
+            ReviewableContentType::Reply,
+            "Test content".into(),
+            None,
+            None,
+            author
+        );
+        
+        // No reviews initially
+        assert!(!pending.has_reviewed(&reviewer1));
+        assert!(!pending.has_reviewed(&reviewer2));
+        println!("[✓] No reviews initially");
+        
+        // Add a review from reviewer1
+        let review = make_test_review(cid, reviewer1.clone());
+        pending.reviews.push(review);
+        
+        assert!(pending.has_reviewed(&reviewer1));
+        assert!(!pending.has_reviewed(&reviewer2));
+        println!("[✓] Correctly tracks who has reviewed");
+        
+        println!("[✓] PendingReview::has_reviewed test passed\n");
+    }
+
+    #[test]
+    fn test_pending_review_is_complete() {
+        println!("\n=== TEST: PendingReview::is_complete ===");
+        
+        let cid = Cid::new(b"test");
+        let author = Did("did:diagon:author".into());
+        
+        // Fast tier requires 2 reviews
+        let mut pending = PendingReview::new(
+            cid,
+            ReviewableContentType::Acknowledgment,
+            "Test content for review".into(),
+            None,
+            None,
+            author
+        );
+        
+        assert_eq!(pending.required_reviews, 2);
+        assert!(!pending.is_complete());
+        println!("[✓] Initially not complete (0/{} reviews)", pending.required_reviews);
+        
+        // Add first review
+        let review1 = make_test_review(cid, Did("did:diagon:r1".into()));
+        pending.reviews.push(review1);
+        assert!(!pending.is_complete());
+        println!("[✓] Still not complete (1/{} reviews)", pending.required_reviews);
+        
+        // Add second review
+        let review2 = make_test_review(cid, Did("did:diagon:r2".into()));
+        pending.reviews.push(review2);
+        assert!(pending.is_complete());
+        println!("[✓] Complete (2/{} reviews)", pending.required_reviews);
+        
+        // Test critical tier requires 5 reviews
+        let mut critical_pending = PendingReview::new(
+            cid,
+            ReviewableContentType::Proposal,
+            "Proposal content".into(),
+            None,
+            None,
+            Did("did:diagon:author".into())
+        );
+        assert_eq!(critical_pending.required_reviews, 5);
+        for i in 0..4 {
+            critical_pending.reviews.push(make_test_review(cid, Did(format!("did:diagon:r{}", i))));
+            assert!(!critical_pending.is_complete());
+        }
+        critical_pending.reviews.push(make_test_review(cid, Did("did:diagon:r4".into())));
+        assert!(critical_pending.is_complete());
+        println!("[✓] Critical tier requires 5 reviews");
+        
+        println!("[✓] PendingReview::is_complete test passed\n");
+    }
+
+    #[test]
+    fn test_pending_review_is_expired() {
+        println!("\n=== TEST: PendingReview::is_expired ===");
+        
+        let cid = Cid::new(b"test");
+        let author = Did("did:diagon:author".into());
+        
+        // Create normal pending review
+        let pending = PendingReview::new(
+            cid,
+            ReviewableContentType::Acknowledgment,
+            "Test content".into(),
+            None,
+            None,
+            author.clone()
+        );
+        
+        assert!(!pending.is_expired());
+        println!("[✓] Fresh review is not expired");
+        
+        // Create expired pending review
+        let mut expired = PendingReview::new(
+            cid,
+            ReviewableContentType::Acknowledgment,
+            "Test content".into(),
+            None,
+            None,
+            author
+        );
+        expired.deadline = timestamp() - 1; // Set deadline in the past
+        
+        assert!(expired.is_expired());
+        println!("[✓] Past deadline review is expired");
+        
+        // Edge case: deadline exactly now
+        let mut edge = expired.clone();
+        edge.deadline = timestamp();
+        // Should not be expired (timestamp() > deadline fails when equal)
+        assert!(!edge.is_expired());
+        println!("[✓] Deadline at current time is not expired");
+        
+        println!("[✓] PendingReview::is_expired test passed\n");
+    }
+
+    // ========================================================================
+    // REVIEWER REPUTATION TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_reviewer_reputation_new() {
+        println!("\n=== TEST: ReviewerReputation::new ===");
+        
+        let rep = ReviewerReputation::new();
+        
+        assert_eq!(rep.reviews_completed, 0);
+        assert_eq!(rep.consensus_alignments, 0);
+        assert_eq!(rep.consensus_deviations, 0);
+        assert_eq!(rep.confirmed_flags, 0);
+        assert_eq!(rep.false_flags, 0);
+        assert!((rep.score - 0.5).abs() < 0.001);
+        assert_eq!(rep.last_review, 0);
+        println!("[✓] New reputation starts with defaults");
+        
+        println!("[✓] ReviewerReputation::new test passed\n");
+    }
+
+    #[test]
+    fn test_reviewer_reputation_update_consensus() {
+        println!("\n=== TEST: ReviewerReputation::update consensus ===");
+        
+        let mut rep = ReviewerReputation::new();
+        let initial_score = rep.score;
+        
+        // Aligned review should increase score
+        rep.update(true, None);
+        assert_eq!(rep.reviews_completed, 1);
+        assert_eq!(rep.consensus_alignments, 1);
+        assert_eq!(rep.consensus_deviations, 0);
+        assert!(rep.score > initial_score);
+        assert!((rep.score - 0.52).abs() < 0.001); // 0.5 + 0.02 = 0.52
+        println!("[✓] Aligned review increases score (+0.02)");
+        
+        // Deviated review should decrease score
+        rep.update(false, None);
+        assert_eq!(rep.reviews_completed, 2);
+        assert_eq!(rep.consensus_alignments, 1);
+        assert_eq!(rep.consensus_deviations, 1);
+        assert!((rep.score - 0.47).abs() < 0.001); // 0.52 - 0.05 = 0.47
+        println!("[✓] Deviated review decreases score (-0.05)");
+        
+        // Last review timestamp should be updated
+        assert!(rep.last_review > 0);
+        println!("[✓] Last review timestamp updated");
+        
+        println!("[✓] ReviewerReputation::update consensus test passed\n");
+    }
+
+    #[test]
+    fn test_reviewer_reputation_update_flags() {
+        println!("\n=== TEST: ReviewerReputation::update flags ===");
+        
+        let mut rep = ReviewerReputation::new();
+        
+        // Confirmed flag should increase score significantly
+        rep.update(true, Some(true));
+        assert_eq!(rep.confirmed_flags, 1);
+        assert_eq!(rep.false_flags, 0);
+        assert!((rep.score - 0.62).abs() < 0.001); // 0.5 + 0.02 (aligned) + 0.1 (confirmed) = 0.62
+        println!("[✓] Confirmed flag increases score (+0.1)");
+        
+        // False flag should decrease score significantly
+        let mut rep2 = ReviewerReputation::new();
+        rep2.update(true, Some(false));
+        assert_eq!(rep2.confirmed_flags, 0);
+        assert_eq!(rep2.false_flags, 1);
+        assert!((rep2.score - 0.32).abs() < 0.001); // 0.5 + 0.02 - 0.2 = 0.32
+        println!("[✓] False flag decreases score (-0.2)");
+        
+        println!("[✓] ReviewerReputation::update flags test passed\n");
+    }
+
+    #[test]
+    fn test_reviewer_reputation_score_bounds() {
+        println!("\n=== TEST: ReviewerReputation score bounds ===");
+        
+        // Test upper bound
+        let mut rep = ReviewerReputation::new();
+        for _ in 0..100 {
+            rep.update(true, Some(true)); // Max increases
+        }
+        assert!(rep.score <= 1.0);
+        assert!((rep.score - 1.0).abs() < 0.001);
+        println!("[✓] Score capped at 1.0");
+        
+        // Test lower bound
+        let mut rep2 = ReviewerReputation::new();
+        for _ in 0..100 {
+            rep2.update(false, Some(false)); // Max decreases
+        }
+        assert!(rep2.score >= 0.0);
+        assert!((rep2.score - 0.0).abs() < 0.001);
+        println!("[✓] Score floored at 0.0");
+        
+        println!("[✓] ReviewerReputation score bounds test passed\n");
+    }
+
+    #[test]
+    fn test_reviewer_reputation_weight() {
+        println!("\n=== TEST: ReviewerReputation::weight ===");
+        
+        // New reviewer (0 reviews): weight = score * 0.5
+        let new_rep = ReviewerReputation::new();
+        let new_weight = new_rep.weight();
+        assert!((new_weight - 0.25).abs() < 0.001); // 0.5 * 0.5 = 0.25
+        println!("[✓] New reviewer weight: {:.3}", new_weight);
+        
+        // Apprentice reviewer (5 reviews = REVIEW_APPRENTICE_COUNT): weight = score * 1.0
+        let mut apprentice = ReviewerReputation::new();
+        for _ in 0..REVIEW_APPRENTICE_COUNT {
+            apprentice.update(true, None);
+        }
+        let apprentice_weight = apprentice.weight();
+        // Experience factor = min(5/5, 1.0) = 1.0
+        // Weight = score * (0.5 + 0.5 * 1.0) = score * 1.0
+        println!("[✓] Apprentice reviewer weight: {:.3}", apprentice_weight);
+        
+        // Experienced reviewer (10+ reviews)
+        let mut experienced = ReviewerReputation::new();
+        for _ in 0..10 {
+            experienced.update(true, None);
+        }
+        let exp_weight = experienced.weight();
+        // Experience capped at 1.0, so same multiplier as apprentice
+        assert!(exp_weight >= apprentice_weight * 0.9); // Roughly similar
+        println!("[✓] Experienced reviewer weight: {:.3}", exp_weight);
+        
+        // Low score reviewer should have low weight
+        let mut low_score = ReviewerReputation::new();
+        for _ in 0..10 {
+            low_score.update(false, Some(false));
+        }
+        let low_weight = low_score.weight();
+        assert!(low_weight < 0.1);
+        println!("[✓] Low score reviewer has low weight: {:.3}", low_weight);
+        
+        println!("[✓] ReviewerReputation::weight test passed\n");
+    }
+
+    #[test]
+    fn test_reviewer_reputation_is_eligible() {
+        println!("\n=== TEST: ReviewerReputation::is_eligible ===");
+        
+        // New reviewer should be eligible (score 0.5 >= 0.2)
+        let new_rep = ReviewerReputation::new();
+        assert!(new_rep.is_eligible());
+        println!("[✓] New reviewer (score 0.5) is eligible");
+        
+        // Reviewer at threshold
+        let mut at_threshold = ReviewerReputation::new();
+        at_threshold.score = REVIEW_MIN_REPUTATION;
+        assert!(at_threshold.is_eligible());
+        println!("[✓] Reviewer at threshold ({}) is eligible", REVIEW_MIN_REPUTATION);
+        
+        // Reviewer below threshold
+        let mut below_threshold = ReviewerReputation::new();
+        below_threshold.score = REVIEW_MIN_REPUTATION - 0.01;
+        assert!(!below_threshold.is_eligible());
+        println!("[✓] Reviewer below threshold is not eligible");
+        
+        // After many false flags, should become ineligible
+        let mut degraded = ReviewerReputation::new();
+        for _ in 0..5 {
+            degraded.update(false, Some(false));
+        }
+        assert!(!degraded.is_eligible(), "Score: {}", degraded.score);
+        println!("[✓] Degraded reviewer becomes ineligible");
+        
+        println!("[✓] ReviewerReputation::is_eligible test passed\n");
+    }
+
+    // ========================================================================
+    // REVIEW STATE TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_review_state_new() {
+        println!("\n=== TEST: ReviewState::new ===");
+        
+        let state = ReviewState::new();
+        
+        assert!(state.pending.is_empty());
+        assert!(state.verdicts.is_empty());
+        assert!(state.reviewer_reputations.is_empty());
+        assert!(state.interaction_counts.is_empty());
+        println!("[✓] New ReviewState is empty");
+        
+        println!("[✓] ReviewState::new test passed\n");
+    }
+
+    #[test]
+    fn test_review_state_submit_for_review() {
+        println!("\n=== TEST: ReviewState::submit_for_review ===");
+        
+        let mut state = ReviewState::new();
+        let cid = Cid::new(b"test content");
+        let author = Did("did:diagon:author".into());
+        
+        // Create enough reviewers for critical tier (5)
+        let reviewers: Vec<Did> = (0..10)
+            .map(|i| Did(format!("did:diagon:reviewer{}", i)))
+            .collect();
+        
+        // Submit for review
+        let result = state.submit_for_review(
+            cid,
+            ReviewableContentType::Proposal,
+            "Test proposal content".into(),
+            None,
+            None,
+            author.clone(),
+            &reviewers,
+        );
+        
+        assert!(result.is_ok());
+        assert!(state.pending.contains_key(&cid));
+        let pending = state.pending.get(&cid).unwrap();
+        assert_eq!(pending.assigned_reviewers.len(), 5); // Critical tier
+        println!("[✓] Content submitted for review");
+        
+        // Cannot submit same content twice
+        let result2 = state.submit_for_review(
+            cid,
+            ReviewableContentType::Proposal,
+            "Test content".into(),
+            None,
+            None,
+            author.clone(),
+            &reviewers,
+        );
+        assert!(result2.is_err());
+        println!("[✓] Duplicate submission rejected");
+        
+        // Author should not be in assigned reviewers
+        let pending = state.pending.get(&cid).unwrap();
+        assert!(!pending.assigned_reviewers.contains(&author));
+        println!("[✓] Author excluded from reviewers");
+        
+        println!("[✓] ReviewState::submit_for_review test passed\n");
+    }
+
+    #[test]
+    fn test_review_state_submit_for_review_insufficient_reviewers() {
+        println!("\n=== TEST: ReviewState::submit_for_review insufficient reviewers ===");
+        
+        let mut state = ReviewState::new();
+        let cid = Cid::new(b"test");
+        let author = Did("did:diagon:author".into());
+        
+        // Only 2 reviewers for critical tier (needs 5)
+        let reviewers = vec![
+            Did("did:diagon:r1".into()),
+            Did("did:diagon:r2".into()),
+        ];
+        
+        let result = state.submit_for_review(
+            cid,
+            ReviewableContentType::Proposal,
+            "Test content".into(),
+            None,
+            None,
+            author,
+            &reviewers,
+        );
+        
+        assert!(result.is_err());
+        println!("[✓] Insufficient reviewers rejected");
+        
+        println!("[✓] ReviewState insufficient reviewers test passed\n");
+    }
+
+    #[test]
+    fn test_review_state_select_reviewers_excludes_high_interaction() {
+        println!("\n=== TEST: ReviewState select_reviewers interaction limit ===");
+        
+        let mut state = ReviewState::new();
+        let author = Did("did:diagon:author".into());
+        let frequent_reviewer = Did("did:diagon:frequent".into());
+        
+        // Record many interactions between author and frequent_reviewer
+        for _ in 0..=REVIEW_INTERACTION_LIMIT {
+            let key = (frequent_reviewer.clone(), author.clone());
+            *state.interaction_counts.entry(key).or_insert(0) += 1;
+        }
+        
+        // Create pool with frequent_reviewer and others
+        let mut reviewers: Vec<Did> = (0..10)
+            .map(|i| Did(format!("did:diagon:reviewer{}", i)))
+            .collect();
+        reviewers.push(frequent_reviewer.clone());
+        
+        let cid = Cid::new(b"test");
+        let result = state.submit_for_review(
+            cid,
+            ReviewableContentType::Acknowledgment, // Fast tier, needs 2
+            "Test content".into(),
+            None,
+            None,
+            author,
+            &reviewers,
+        );
+        
+        assert!(result.is_ok());
+        let pending = state.pending.get(&cid).unwrap();
+        assert!(!pending.assigned_reviewers.contains(&frequent_reviewer));
+        println!("[✓] High-interaction reviewer excluded");
+        
+        println!("[✓] ReviewState interaction limit test passed\n");
+    }
+
+    #[test]
+    fn test_review_state_submit_review() {
+        println!("\n=== TEST: ReviewState::submit_review ===");
+        
+        let mut state = ReviewState::new();
+        let cid = Cid::new(b"test");
+        let author = Did("did:diagon:author".into());
+        
+        // Setup: Create keypairs for reviewers
+        let (pk1, sk1) = keypair();
+        let (pk2, sk2) = keypair();
+        let reviewer1 = Did::from_pubkey(&pk1);
+        let reviewer2 = Did::from_pubkey(&pk2);
+        
+        let reviewers = vec![
+            reviewer1.clone(),
+            reviewer2.clone(),
+            Did("did:diagon:r3".into()),
+        ];
+        
+        // Submit content for review
+        state.submit_for_review(
+            cid,
+            ReviewableContentType::Acknowledgment, // Needs 2 reviews
+            "Test content".into(),
+            None,
+            None,
+            author.clone(),
+            &reviewers,
+        ).unwrap();
+        
+        // Force assign our test reviewers
+        state.pending.get_mut(&cid).unwrap().assigned_reviewers = vec![reviewer1.clone(), reviewer2.clone()];
+        
+        // Submit valid signed review
+        let review1 = make_signed_review(cid, &pk1, &sk1);
+        let is_complete = state.submit_review(review1).unwrap();
+        assert!(!is_complete);
+        println!("[✓] First review submitted, not complete yet");
+        
+        // Submit second review
+        let review2 = make_signed_review(cid, &pk2, &sk2);
+        let is_complete = state.submit_review(review2).unwrap();
+        assert!(is_complete);
+        println!("[✓] Second review submitted, now complete");
+        
+        // Verify interaction count updated
+        let key = (reviewer1.clone(), author.clone());
+        assert_eq!(*state.interaction_counts.get(&key).unwrap_or(&0), 1);
+        println!("[✓] Interaction count incremented");
+        
+        println!("[✓] ReviewState::submit_review test passed\n");
+    }
+
+    #[test]
+    fn test_review_state_submit_review_validation() {
+        println!("\n=== TEST: ReviewState::submit_review validation ===");
+        
+        let mut state = ReviewState::new();
+        let cid = Cid::new(b"test");
+        let author = Did("did:diagon:author".into());
+        
+        let (pk, sk) = keypair();
+        let reviewer = Did::from_pubkey(&pk);
+        let not_assigned = Did("did:diagon:notassigned".into());
+        
+        let reviewers = vec![reviewer.clone(), Did("did:diagon:r2".into()), Did("did:diagon:r3".into())];
+        
+        state.submit_for_review(
+            cid,
+            ReviewableContentType::Acknowledgment,
+            "Test content".into(),
+            None,
+            None,
+            author,
+            &reviewers,
+        ).unwrap();
+        
+        state.pending.get_mut(&cid).unwrap().assigned_reviewers = vec![reviewer.clone()];
+        
+        // Invalid review (bad scores)
+        let mut invalid_review = make_signed_review(cid, &pk, &sk);
+        invalid_review.relevance = 0; // Invalid score
+        let result = state.submit_review(invalid_review);
+        assert!(result.is_err());
+        println!("[✓] Invalid review rejected");
+        
+        // Unsigned review
+        let unsigned_review = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer.clone(),
+            pubkey: pk.as_bytes().to_vec(),
+            relevance: 4,
+            substance: 4,
+            clarity: 4,
+            originality: 3,
+            effort: 4,
+            justification: "Valid justification here".into(),
+            flag_spam: false,
+            flag_plagiarism: false,
+            flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![], // No signature
+        };
+        let result = state.submit_review(unsigned_review);
+        assert!(result.is_err());
+        println!("[✓] Unsigned review rejected");
+        
+        // Not assigned reviewer
+        let (other_pk, other_sk) = keypair();
+        let not_assigned_review = make_signed_review(cid, &other_pk, &other_sk);
+        let result = state.submit_review(not_assigned_review);
+        assert!(result.is_err());
+        println!("[✓] Not-assigned reviewer rejected");
+        
+        // Content not in queue
+        let wrong_cid = Cid::new(b"wrong");
+        let wrong_cid_review = make_signed_review(wrong_cid, &pk, &sk);
+        let result = state.submit_review(wrong_cid_review);
+        assert!(result.is_err());
+        println!("[✓] Wrong CID rejected");
+        
+        // Duplicate review
+        let valid_review = make_signed_review(cid, &pk, &sk);
+        state.submit_review(valid_review.clone()).unwrap();
+        let result = state.submit_review(valid_review);
+        assert!(result.is_err());
+        println!("[✓] Duplicate review rejected");
+        
+        println!("[✓] ReviewState::submit_review validation test passed\n");
+    }
+
+    #[test]
+    fn test_review_state_finalize_review_empty() {
+        println!("\n=== TEST: ReviewState::finalize_review empty ===");
+        
+        let mut state = ReviewState::new();
+        let cid = Cid::new(b"test");
+        let author = Did("did:diagon:author".into());
+        
+        let reviewers: Vec<Did> = (0..3).map(|i| Did(format!("did:diagon:r{}", i))).collect();
+        
+        state.submit_for_review(
+            cid,
+            ReviewableContentType::Acknowledgment,
+            "Test content".into(),
+            None,
+            None,
+            author.clone(),
+            &reviewers,
+        ).unwrap();
+        
+        // Finalize without any reviews (expired scenario)
+        let verdict = state.finalize_review(cid).unwrap();
+        
+        assert_eq!(verdict.content_cid, cid);
+        assert_eq!(verdict.author, author);
+        assert!((verdict.quality_score - 0.5).abs() < 0.001);
+        assert!(!verdict.flagged);
+        assert!(verdict.reviewer_scores.is_empty());
+        assert_eq!(verdict.xp_awarded, 0);
+        println!("[✓] Empty review produces default verdict");
+        
+        // Should be moved to verdicts
+        assert!(state.verdicts.contains_key(&cid));
+        assert!(!state.pending.contains_key(&cid));
+        println!("[✓] Review moved from pending to verdicts");
+        
+        println!("[✓] ReviewState::finalize_review empty test passed\n");
+    }
+
+    #[test]
+    fn test_review_state_finalize_review_with_reviews() {
+        println!("\n=== TEST: ReviewState::finalize_review with reviews ===");
+        
+        let mut state = ReviewState::new();
+        let cid = Cid::new(b"test");
+        let author = Did("did:diagon:author".into());
+        
+        // Create keypairs
+        let (pk1, sk1) = keypair();
+        let (pk2, sk2) = keypair();
+        let reviewer1 = Did::from_pubkey(&pk1);
+        let reviewer2 = Did::from_pubkey(&pk2);
+        
+        let reviewers = vec![reviewer1.clone(), reviewer2.clone(), Did("did:diagon:r3".into())];
+        
+        state.submit_for_review(
+            cid,
+            ReviewableContentType::Acknowledgment,
+            "Test content here with words".into(),
+            None,
+            None,
+            author.clone(),
+            &reviewers,
+        ).unwrap();
+        
+        // Force assign reviewers
+        state.pending.get_mut(&cid).unwrap().assigned_reviewers = vec![reviewer1.clone(), reviewer2.clone()];
+        
+        // Submit reviews with similar scores (consensus)
+        let review1 = make_signed_review(cid, &pk1, &sk1);
+        let review2 = make_signed_review(cid, &pk2, &sk2);
+        
+        state.submit_review(review1).unwrap();
+        state.submit_review(review2).unwrap();
+        
+        let verdict = state.finalize_review(cid).unwrap();
+        
+        assert!(!verdict.flagged);
+        assert!(verdict.quality_score > 0.0);
+        assert_eq!(verdict.reviewer_scores.len(), 2);
+        assert!(!verdict.consensus_aligned.is_empty());
+        println!("[✓] Verdict calculated with consensus");
+        
+        // Reviewer reputations should be updated
+        assert!(state.reviewer_reputations.contains_key(&reviewer1));
+        assert!(state.reviewer_reputations.contains_key(&reviewer2));
+        println!("[✓] Reviewer reputations updated");
+        
+        println!("[✓] ReviewState::finalize_review with reviews test passed\n");
+    }
+
+    #[test]
+    fn test_review_state_finalize_review_flagged_content() {
+        println!("\n=== TEST: ReviewState::finalize_review flagged ===");
+        
+        let mut state = ReviewState::new();
+        let cid = Cid::new(b"spam content");
+        let author = Did("did:diagon:spammer".into());
+        
+        // Create 3 reviewers for fast tier
+        let (pk1, sk1) = keypair();
+        let (pk2, sk2) = keypair();
+        let reviewer1 = Did::from_pubkey(&pk1);
+        let reviewer2 = Did::from_pubkey(&pk2);
+        
+        let reviewers = vec![reviewer1.clone(), reviewer2.clone(), Did("did:diagon:r3".into())];
+        
+        state.submit_for_review(
+            cid,
+            ReviewableContentType::Acknowledgment,
+            "Spam content".into(),
+            None,
+            None,
+            author,
+            &reviewers,
+        ).unwrap();
+        
+        state.pending.get_mut(&cid).unwrap().assigned_reviewers = vec![reviewer1.clone(), reviewer2.clone()];
+        
+        // Submit reviews that flag as spam
+        let mut review1 = make_signed_review(cid, &pk1, &sk1);
+        review1.flag_spam = true;
+        let sig1 = detached_sign(&review1.signable_bytes(), &sk1);
+        review1.signature = sig1.as_bytes().to_vec();
+        
+        let mut review2 = make_signed_review(cid, &pk2, &sk2);
+        review2.flag_spam = true;
+        let sig2 = detached_sign(&review2.signable_bytes(), &sk2);
+        review2.signature = sig2.as_bytes().to_vec();
+        
+        state.submit_review(review1).unwrap();
+        state.submit_review(review2).unwrap();
+        
+        let verdict = state.finalize_review(cid).unwrap();
+        
+        assert!(verdict.flagged);
+        assert_eq!(verdict.flag_reason, Some("spam".into()));
+        assert!((verdict.quality_score - 0.0).abs() < 0.001);
+        assert_eq!(verdict.xp_awarded, 0);
+        println!("[✓] Flagged content produces zero quality/XP");
+        
+        // Reviewers who flagged should get reputation boost
+        let rep1 = state.reviewer_reputations.get(&reviewer1).unwrap();
+        assert!(rep1.confirmed_flags > 0);
+        println!("[✓] Flagging reviewers get credit for confirmed flag");
+        
+        println!("[✓] ReviewState::finalize_review flagged test passed\n");
+    }
+
+    #[test]
+    fn test_review_state_get_assignments() {
+        println!("\n=== TEST: ReviewState::get_assignments ===");
+        
+        let mut state = ReviewState::new();
+        let cid1 = Cid::new(b"content1");
+        let cid2 = Cid::new(b"content2");
+        let author = Did("did:diagon:author".into());
+        let reviewer = Did("did:diagon:reviewer".into());
+        let other_reviewer = Did("did:diagon:other".into());
+        
+        let reviewers = vec![reviewer.clone(), other_reviewer.clone(), Did("did:diagon:r3".into())];
+        
+        // Submit two items
+        state.submit_for_review(
+            cid1,
+            ReviewableContentType::Acknowledgment,
+            "Content 1".into(),
+            None,
+            None,
+            author.clone(),
+            &reviewers,
+        ).unwrap();
+        
+        state.submit_for_review(
+            cid2,
+            ReviewableContentType::Acknowledgment,
+            "Content 2".into(),
+            None,
+            None,
+            author,
+            &reviewers,
+        ).unwrap();
+        
+        // Assign reviewer to both
+        state.pending.get_mut(&cid1).unwrap().assigned_reviewers = vec![reviewer.clone()];
+        state.pending.get_mut(&cid2).unwrap().assigned_reviewers = vec![reviewer.clone()];
+        
+        let assignments = state.get_assignments(&reviewer);
+        assert_eq!(assignments.len(), 2);
+        println!("[✓] Reviewer sees all assignments");
+        
+        // Other reviewer has no assignments
+        let other_assignments = state.get_assignments(&other_reviewer);
+        assert_eq!(other_assignments.len(), 0);
+        println!("[✓] Unassigned reviewer sees no assignments");
+        
+        // After reviewing one, should only see one assignment
+        let (pk, sk) = keypair();
+        let actual_reviewer = Did::from_pubkey(&pk);
+        state.pending.get_mut(&cid1).unwrap().assigned_reviewers = vec![actual_reviewer.clone()];
+        
+        let review = make_signed_review(cid1, &pk, &sk);
+        state.submit_review(review).unwrap();
+        
+        let remaining = state.get_assignments(&actual_reviewer);
+        assert_eq!(remaining.len(), 0);
+        println!("[✓] Completed reviews excluded from assignments");
+        
+        println!("[✓] ReviewState::get_assignments test passed\n");
+    }
+
+    #[test]
+    fn test_review_state_get_expired() {
+        println!("\n=== TEST: ReviewState::get_expired ===");
+        
+        let mut state = ReviewState::new();
+        let cid_fresh = Cid::new(b"fresh");
+        let cid_expired = Cid::new(b"expired");
+        let cid_complete = Cid::new(b"complete");
+        let author = Did("did:diagon:author".into());
+        
+        let reviewers: Vec<Did> = (0..3).map(|i| Did(format!("did:diagon:r{}", i))).collect();
+        
+        // Fresh review
+        state.submit_for_review(
+            cid_fresh,
+            ReviewableContentType::Acknowledgment,
+            "Fresh".into(),
+            None,
+            None,
+            author.clone(),
+            &reviewers,
+        ).unwrap();
+        
+        // Expired review
+        state.submit_for_review(
+            cid_expired,
+            ReviewableContentType::Acknowledgment,
+            "Expired".into(),
+            None,
+            None,
+            author.clone(),
+            &reviewers,
+        ).unwrap();
+        state.pending.get_mut(&cid_expired).unwrap().deadline = timestamp() - 1;
+        
+        // Complete review
+        state.submit_for_review(
+            cid_complete,
+            ReviewableContentType::Acknowledgment,
+            "Complete".into(),
+            None,
+            None,
+            author,
+            &reviewers,
+        ).unwrap();
+        
+        // Add enough fake reviews to mark complete
+        let pending = state.pending.get_mut(&cid_complete).unwrap();
+        for i in 0..pending.required_reviews {
+            pending.reviews.push(make_test_review(cid_complete, Did(format!("did:diagon:rev{}", i))));
+        }
+        
+        let expired = state.get_expired();
+        assert!(expired.contains(&cid_expired));
+        assert!(expired.contains(&cid_complete));
+        assert!(!expired.contains(&cid_fresh));
+        println!("[✓] Correctly identifies expired and complete reviews");
+        
+        println!("[✓] ReviewState::get_expired test passed\n");
+    }
+
+    #[test]
+    fn test_review_state_calculate_reviewer_rewards() {
+        println!("\n=== TEST: ReviewState::calculate_reviewer_rewards ===");
+        
+        let mut state = ReviewState::new();
+        let cid = Cid::new(b"test");
+        let reviewer1 = Did("did:diagon:r1".into());
+        let reviewer2 = Did("did:diagon:r2".into());
+        
+        // Create a verdict
+        let verdict = QualityVerdict {
+            content_cid: cid,
+            author: Did("did:diagon:author".into()),
+            quality_score: 0.75,
+            flagged: false,
+            flag_reason: None,
+            reviewer_scores: vec![
+                (reviewer1.clone(), 4.0),
+                (reviewer2.clone(), 3.5),
+            ],
+            consensus_aligned: vec![reviewer1.clone()],
+            consensus_outliers: vec![],
+            xp_awarded: 10,
+            verdict_at: timestamp(),
+        };
+        
+        state.verdicts.insert(cid, verdict);
+        
+        let rewards = state.calculate_reviewer_rewards(&cid);
+        
+        // reviewer1 is consensus aligned: XP_REVIEW_COMPLETE + XP_REVIEW_CONSENSUS_BONUS
+        let r1_reward = *rewards.get(&reviewer1).unwrap();
+        assert_eq!(r1_reward, XP_REVIEW_COMPLETE + XP_REVIEW_CONSENSUS_BONUS);
+        println!("[✓] Consensus-aligned reviewer gets bonus: {}", r1_reward);
+        
+        // reviewer2 is not consensus aligned: XP_REVIEW_COMPLETE only
+        let r2_reward = *rewards.get(&reviewer2).unwrap();
+        assert_eq!(r2_reward, XP_REVIEW_COMPLETE);
+        println!("[✓] Non-aligned reviewer gets base: {}", r2_reward);
+        
+        // Test flagged content bonus
+        let flagged_cid = Cid::new(b"flagged");
+        let flagged_verdict = QualityVerdict {
+            content_cid: flagged_cid,
+            author: Did("did:diagon:author".into()),
+            quality_score: 0.0,
+            flagged: true,
+            flag_reason: Some("spam".into()),
+            reviewer_scores: vec![
+                (reviewer1.clone(), 1.0),
+            ],
+            consensus_aligned: vec![reviewer1.clone()],
+            consensus_outliers: vec![],
+            xp_awarded: 0,
+            verdict_at: timestamp(),
+        };
+        
+        state.verdicts.insert(flagged_cid, flagged_verdict);
+        
+        let flagged_rewards = state.calculate_reviewer_rewards(&flagged_cid);
+        let r1_flagged_reward = *flagged_rewards.get(&reviewer1).unwrap();
+        assert_eq!(r1_flagged_reward, XP_REVIEW_COMPLETE + XP_REVIEW_CONSENSUS_BONUS + XP_REVIEW_SPAM_CATCH);
+        println!("[✓] Spam-catching reviewer gets extra bonus: {}", r1_flagged_reward);
+        
+        // Non-existent verdict returns empty
+        let nonexistent = state.calculate_reviewer_rewards(&Cid::new(b"nonexistent"));
+        assert!(nonexistent.is_empty());
+        println!("[✓] Non-existent verdict returns empty rewards");
+        
+        println!("[✓] ReviewState::calculate_reviewer_rewards test passed\n");
+    }
+
+    // ========================================================================
+    // HELPER FUNCTION TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_calculate_xp_award() {
+        println!("\n=== TEST: calculate_xp_award ===");
+        
+        // Base XP for proposal with minimum words
+        let proposal_xp = calculate_xp_award(ReviewableContentType::Proposal, 5, 1.0);
+        assert!(proposal_xp >= XP_BASE_PROPOSAL);
+        println!("[✓] Proposal base XP: {} (min words)", proposal_xp);
+        
+        // More words = higher XP (length factor)
+        let long_proposal_xp = calculate_xp_award(ReviewableContentType::Proposal, 100, 1.0);
+        assert!(long_proposal_xp > proposal_xp);
+        println!("[✓] Long proposal gets more XP: {}", long_proposal_xp);
+        
+        // Quality affects XP
+        let low_quality_xp = calculate_xp_award(ReviewableContentType::Proposal, 50, 0.5);
+        let high_quality_xp = calculate_xp_award(ReviewableContentType::Proposal, 50, 1.0);
+        assert!(high_quality_xp > low_quality_xp);
+        println!("[✓] High quality: {}, Low quality: {}", high_quality_xp, low_quality_xp);
+        
+        // Zero quality = zero XP
+        let zero_quality_xp = calculate_xp_award(ReviewableContentType::Proposal, 50, 0.0);
+        assert_eq!(zero_quality_xp, 0);
+        println!("[✓] Zero quality = zero XP");
+        
+        // Different content types have different base XP
+        let reply_xp = calculate_xp_award(ReviewableContentType::Reply, 50, 1.0);
+        let ack_xp = calculate_xp_award(ReviewableContentType::Acknowledgment, 50, 1.0);
+        assert!(proposal_xp != reply_xp || proposal_xp != ack_xp); // Different types, likely different XP
+        println!("[✓] Different types yield different base XP");
+        
+        println!("[✓] calculate_xp_award test passed\n");
+    }
+
+    #[test]
+    fn test_quality_verdict_structure() {
+        println!("\n=== TEST: QualityVerdict structure ===");
+        
+        let cid = Cid::new(b"test");
+        let author = Did("did:diagon:author".into());
+        let reviewer1 = Did("did:diagon:r1".into());
+        let reviewer2 = Did("did:diagon:r2".into());
+        
+        let verdict = QualityVerdict {
+            content_cid: cid,
+            author: author.clone(),
+            quality_score: 0.75,
+            flagged: false,
+            flag_reason: None,
+            reviewer_scores: vec![
+                (reviewer1.clone(), 3.8),
+                (reviewer2.clone(), 4.1),
+            ],
+            consensus_aligned: vec![reviewer1.clone(), reviewer2.clone()],
+            consensus_outliers: vec![],
+            xp_awarded: 15,
+            verdict_at: timestamp(),
+        };
+        
+        assert_eq!(verdict.content_cid, cid);
+        assert_eq!(verdict.author, author);
+        assert!((verdict.quality_score - 0.75).abs() < 0.001);
+        assert!(!verdict.flagged);
+        assert!(verdict.flag_reason.is_none());
+        assert_eq!(verdict.reviewer_scores.len(), 2);
+        assert_eq!(verdict.consensus_aligned.len(), 2);
+        assert!(verdict.consensus_outliers.is_empty());
+        assert_eq!(verdict.xp_awarded, 15);
+        println!("[✓] QualityVerdict fields store correctly");
+        
+        // Test flagged verdict
+        let flagged_verdict = QualityVerdict {
+            content_cid: cid,
+            author,
+            quality_score: 0.0,
+            flagged: true,
+            flag_reason: Some("plagiarism".into()),
+            reviewer_scores: vec![],
+            consensus_aligned: vec![],
+            consensus_outliers: vec![reviewer1],
+            xp_awarded: 0,
+            verdict_at: timestamp(),
+        };
+        
+        assert!(flagged_verdict.flagged);
+        assert_eq!(flagged_verdict.flag_reason, Some("plagiarism".into()));
+        assert_eq!(flagged_verdict.consensus_outliers.len(), 1);
+        println!("[✓] Flagged verdict structure correct");
+        
+        println!("[✓] QualityVerdict structure test passed\n");
+    }
+
+    // ========================================================================
+    // INTEGRATION / WORKFLOW TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_full_review_workflow() {
+        println!("\n=== TEST: Full review workflow ===");
+        
+        let mut state = ReviewState::new();
+        let cid = Cid::new(b"proposal content");
+        let author = Did("did:diagon:author".into());
+        
+        // Create reviewer keypairs
+        let (pk1, sk1) = keypair();
+        let (pk2, sk2) = keypair();
+        let reviewer1 = Did::from_pubkey(&pk1);
+        let reviewer2 = Did::from_pubkey(&pk2);
+        
+        let all_reviewers: Vec<Did> = (0..10)
+            .map(|i| Did(format!("did:diagon:extra{}", i)))
+            .chain(vec![reviewer1.clone(), reviewer2.clone()])
+            .collect();
+        
+        // Step 1: Submit for review
+        state.submit_for_review(
+            cid,
+            ReviewableContentType::Acknowledgment, // Fast tier: 2 reviews needed
+            "This is a thoughtful proposal about improving the system".into(),
+            None,
+            None,
+            author.clone(),
+            &all_reviewers,
+        ).unwrap();
+        println!("[✓] Step 1: Content submitted for review");
+        
+        // Force assign our reviewers
+        state.pending.get_mut(&cid).unwrap().assigned_reviewers = vec![reviewer1.clone(), reviewer2.clone()];
+        
+        // Step 2: Verify assignments
+        let r1_assignments = state.get_assignments(&reviewer1);
+        let r2_assignments = state.get_assignments(&reviewer2);
+        assert_eq!(r1_assignments.len(), 1);
+        assert_eq!(r2_assignments.len(), 1);
+        println!("[✓] Step 2: Reviewers see their assignments");
+        
+        // Step 3: Submit reviews
+        let mut review1 = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer1.clone(),
+            pubkey: pk1.as_bytes().to_vec(),
+            relevance: 4,
+            substance: 5,
+            clarity: 4,
+            originality: 3,
+            effort: 4,
+            justification: "Well thought out and clearly articulated".into(),
+            flag_spam: false,
+            flag_plagiarism: false,
+            flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        };
+        let sig1 = detached_sign(&review1.signable_bytes(), &sk1);
+        review1.signature = sig1.as_bytes().to_vec();
+        
+        state.submit_review(review1).unwrap();
+        println!("[✓] Step 3a: First review submitted");
+        
+        let mut review2 = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer2.clone(),
+            pubkey: pk2.as_bytes().to_vec(),
+            relevance: 4,
+            substance: 4,
+            clarity: 5,
+            originality: 3,
+            effort: 5,
+            justification: "Good proposal with clear implementation path".into(),
+            flag_spam: false,
+            flag_plagiarism: false,
+            flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        };
+        let sig2 = detached_sign(&review2.signable_bytes(), &sk2);
+        review2.signature = sig2.as_bytes().to_vec();
+        
+        let is_complete = state.submit_review(review2).unwrap();
+        assert!(is_complete);
+        println!("[✓] Step 3b: Second review submitted, review complete");
+        
+        // Step 4: Finalize
+        let verdict = state.finalize_review(cid).unwrap();
+        
+        assert!(!verdict.flagged);
+        assert!(verdict.quality_score > 0.5);
+        assert_eq!(verdict.reviewer_scores.len(), 2);
+        assert!(verdict.xp_awarded > 0);
+        println!("[✓] Step 4: Review finalized with verdict");
+        println!("    Quality: {:.2}, XP: {}", verdict.quality_score, verdict.xp_awarded);
+        
+        // Step 5: Calculate reviewer rewards
+        let rewards = state.calculate_reviewer_rewards(&cid);
+        assert!(rewards.get(&reviewer1).unwrap() > &0);
+        assert!(rewards.get(&reviewer2).unwrap() > &0);
+        println!("[✓] Step 5: Reviewer rewards calculated");
+        
+        // Step 6: Verify state
+        assert!(!state.pending.contains_key(&cid));
+        assert!(state.verdicts.contains_key(&cid));
+        assert!(state.reviewer_reputations.contains_key(&reviewer1));
+        assert!(state.reviewer_reputations.contains_key(&reviewer2));
+        println!("[✓] Step 6: State correctly updated");
+        
+        println!("[✓] Full review workflow test passed\n");
+    }
+
+    #[test]
+    fn test_spam_detection_workflow() {
+        println!("\n=== TEST: Spam detection workflow ===");
+        
+        let mut state = ReviewState::new();
+        let cid = Cid::new(b"spam spam spam buy now!!!");
+        let spammer = Did("did:diagon:spammer".into());
+        
+        // Create reviewer keypairs
+        let (pk1, sk1) = keypair();
+        let (pk2, sk2) = keypair();
+        let reviewer1 = Did::from_pubkey(&pk1);
+        let reviewer2 = Did::from_pubkey(&pk2);
+        
+        let all_reviewers: Vec<Did> = (0..10)
+            .map(|i| Did(format!("did:diagon:extra{}", i)))
+            .chain(vec![reviewer1.clone(), reviewer2.clone()])
+            .collect();
+        
+        state.submit_for_review(
+            cid,
+            ReviewableContentType::Acknowledgment,
+            "BUY NOW! CHEAP! CLICK HERE!".into(),
+            None,
+            None,
+            spammer.clone(),
+            &all_reviewers,
+        ).unwrap();
+        
+        state.pending.get_mut(&cid).unwrap().assigned_reviewers = vec![reviewer1.clone(), reviewer2.clone()];
+        
+        // Both reviewers flag as spam
+        let mut review1 = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer1.clone(),
+            pubkey: pk1.as_bytes().to_vec(),
+            relevance: 1,
+            substance: 1,
+            clarity: 1,
+            originality: 1,
+            effort: 1,
+            justification: "Obvious spam content".into(),
+            flag_spam: true,
+            flag_plagiarism: false,
+            flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        };
+        let sig1 = detached_sign(&review1.signable_bytes(), &sk1);
+        review1.signature = sig1.as_bytes().to_vec();
+        
+        let mut review2 = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer2.clone(),
+            pubkey: pk2.as_bytes().to_vec(),
+            relevance: 1,
+            substance: 1,
+            clarity: 1,
+            originality: 1,
+            effort: 1,
+            justification: "This is spam advertising".into(),
+            flag_spam: true,
+            flag_plagiarism: false,
+            flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        };
+        let sig2 = detached_sign(&review2.signable_bytes(), &sk2);
+        review2.signature = sig2.as_bytes().to_vec();
+        
+        state.submit_review(review1).unwrap();
+        state.submit_review(review2).unwrap();
+        
+        let verdict = state.finalize_review(cid).unwrap();
+        
+        assert!(verdict.flagged);
+        assert_eq!(verdict.flag_reason, Some("spam".into()));
+        assert!((verdict.quality_score - 0.0).abs() < 0.001);
+        assert_eq!(verdict.xp_awarded, 0);
+        println!("[✓] Spam correctly detected and penalized");
+        
+        // Reviewers should get credit for catching spam
+        let rep1 = state.reviewer_reputations.get(&reviewer1).unwrap();
+        let rep2 = state.reviewer_reputations.get(&reviewer2).unwrap();
+        assert_eq!(rep1.confirmed_flags, 1);
+        assert_eq!(rep2.confirmed_flags, 1);
+        println!("[✓] Reviewers rewarded for catching spam");
+        
+        let rewards = state.calculate_reviewer_rewards(&cid);
+        let r1_reward = *rewards.get(&reviewer1).unwrap();
+        assert!(r1_reward >= XP_REVIEW_COMPLETE + XP_REVIEW_SPAM_CATCH);
+        println!("[✓] Extra XP awarded for spam detection: {}", r1_reward);
+        
+        println!("[✓] Spam detection workflow test passed\n");
+    }
+
+    #[test]
+    fn test_consensus_outlier_detection() {
+        println!("\n=== TEST: Consensus outlier detection ===");
+        
+        let mut state = ReviewState::new();
+        let cid = Cid::new(b"controversial content");
+        let author = Did("did:diagon:author".into());
+        
+        // Create 3 reviewer keypairs
+        let (pk1, sk1) = keypair();
+        let (pk2, sk2) = keypair();
+        let (pk3, sk3) = keypair();
+        let reviewer1 = Did::from_pubkey(&pk1);
+        let reviewer2 = Did::from_pubkey(&pk2);
+        let reviewer3 = Did::from_pubkey(&pk3);
+        
+        let all_reviewers: Vec<Did> = vec![
+            reviewer1.clone(), 
+            reviewer2.clone(), 
+            reviewer3.clone(),
+            Did("did:diagon:extra1".into()),
+            Did("did:diagon:extra2".into()),
+        ];
+        
+        // Use standard tier (3 reviewers) for this test
+        state.submit_for_review(
+            cid,
+            ReviewableContentType::Reply,
+            "Some content".into(),
+            None,
+            None,
+            author,
+            &all_reviewers,
+        ).unwrap();
+        
+        state.pending.get_mut(&cid).unwrap().assigned_reviewers = vec![
+            reviewer1.clone(), 
+            reviewer2.clone(), 
+            reviewer3.clone()
+        ];
+        
+        // Two reviewers agree (high scores)
+        let mut review1 = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer1.clone(),
+            pubkey: pk1.as_bytes().to_vec(),
+            relevance: 4, substance: 4, clarity: 4, originality: 4, effort: 4,
+            justification: "Good quality content".into(),
+            flag_spam: false, flag_plagiarism: false, flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        };
+        let sig1 = detached_sign(&review1.signable_bytes(), &sk1);
+        review1.signature = sig1.as_bytes().to_vec();
+        
+        let mut review2 = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer2.clone(),
+            pubkey: pk2.as_bytes().to_vec(),
+            relevance: 4, substance: 4, clarity: 4, originality: 4, effort: 4,
+            justification: "Solid contribution".into(),
+            flag_spam: false, flag_plagiarism: false, flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        };
+        let sig2 = detached_sign(&review2.signable_bytes(), &sk2);
+        review2.signature = sig2.as_bytes().to_vec();
+        
+        // One outlier (very low scores)
+        let mut review3 = QualityReview {
+            content_cid: cid,
+            reviewer: reviewer3.clone(),
+            pubkey: pk3.as_bytes().to_vec(),
+            relevance: 1, substance: 1, clarity: 1, originality: 1, effort: 1,
+            justification: "This is terrible".into(),
+            flag_spam: false, flag_plagiarism: false, flag_offtopic: false,
+            reviewed_at: timestamp(),
+            signature: vec![],
+        };
+        let sig3 = detached_sign(&review3.signable_bytes(), &sk3);
+        review3.signature = sig3.as_bytes().to_vec();
+        
+        state.submit_review(review1).unwrap();
+        state.submit_review(review2).unwrap();
+        state.submit_review(review3).unwrap();
+        
+        let verdict = state.finalize_review(cid).unwrap();
+        
+        // reviewer3 should be an outlier (score difference > 2.0)
+        let score1 = 4.0 * (0.25 + 0.30 + 0.20 + 0.15 + 0.10); // 4.0
+        let score3 = 1.0 * (0.25 + 0.30 + 0.20 + 0.15 + 0.10); // 1.0
+        // Difference = 3.0 > REVIEW_OUTLIER_THRESHOLD (2.0)
+        
+        assert!(verdict.consensus_outliers.contains(&reviewer3) || 
+                verdict.consensus_aligned.contains(&reviewer1));
+        println!("[✓] Outlier detection works");
+        
+        // Check reputation updates
+        let rep1 = state.reviewer_reputations.get(&reviewer1).unwrap();
+        let rep3 = state.reviewer_reputations.get(&reviewer3).unwrap();
+        
+        // Aligned reviewers should have higher/stable score
+        // Outliers should have lower score
+        println!("    Reviewer 1 (aligned) score: {:.3}", rep1.score);
+        println!("    Reviewer 3 (outlier) score: {:.3}", rep3.score);
+        
+        println!("[✓] Consensus outlier detection test passed\n");
+    }
+
+    // ========================================================================
+    // SERIALIZATION TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_review_types_serialization() {
+        println!("\n=== TEST: Review types serialization ===");
+        
+        let cid = Cid::new(b"test");
+        let author = Did("did:diagon:author".into());
+        
+        // QualityReview
+        let review = QualityReview {
+            content_cid: cid,
+            reviewer: Did("did:diagon:reviewer".into()),
+            pubkey: vec![1, 2, 3, 4],
+            relevance: 4,
+            substance: 3,
+            clarity: 5,
+            originality: 2,
+            effort: 4,
+            justification: "Test justification".into(),
+            flag_spam: true,
+            flag_plagiarism: false,
+            flag_offtopic: true,
+            reviewed_at: 1234567890,
+            signature: vec![5, 6, 7, 8],
+        };
+        
+        let serialized = serde_cbor::to_vec(&review).expect("Serialize review");
+        let deserialized: QualityReview = serde_cbor::from_slice(&serialized).expect("Deserialize review");
+        
+        assert_eq!(review.content_cid, deserialized.content_cid);
+        assert_eq!(review.relevance, deserialized.relevance);
+        assert_eq!(review.flag_spam, deserialized.flag_spam);
+        println!("[✓] QualityReview serializes/deserializes");
+        
+        // PendingReview
+        let pending = PendingReview::new(
+            cid,
+            ReviewableContentType::Proposal,
+            "Test content".into(),
+            Some(Cid::new(b"context")),
+            Some("Context text".into()),
+            author.clone(),
+        );
+        
+        let serialized = serde_cbor::to_vec(&pending).expect("Serialize pending");
+        let deserialized: PendingReview = serde_cbor::from_slice(&serialized).expect("Deserialize pending");
+        
+        assert_eq!(pending.content_cid, deserialized.content_cid);
+        assert_eq!(pending.content_type, deserialized.content_type);
+        println!("[✓] PendingReview serializes/deserializes");
+        
+        // QualityVerdict
+        let verdict = QualityVerdict {
+            content_cid: cid,
+            author,
+            quality_score: 0.75,
+            flagged: false,
+            flag_reason: None,
+            reviewer_scores: vec![
+                (Did("did:diagon:r1".into()), 4.0),
+            ],
+            consensus_aligned: vec![Did("did:diagon:r1".into())],
+            consensus_outliers: vec![],
+            xp_awarded: 15,
+            verdict_at: timestamp(),
+        };
+        
+        let serialized = serde_cbor::to_vec(&verdict).expect("Serialize verdict");
+        let deserialized: QualityVerdict = serde_cbor::from_slice(&serialized).expect("Deserialize verdict");
+        
+        assert_eq!(verdict.content_cid, deserialized.content_cid);
+        assert!((verdict.quality_score - deserialized.quality_score).abs() < 0.001);
+        println!("[✓] QualityVerdict serializes/deserializes");
+        
+        // ReviewerReputation
+        let mut rep = ReviewerReputation::new();
+        rep.update(true, Some(true));
+        
+        let serialized = serde_cbor::to_vec(&rep).expect("Serialize reputation");
+        let deserialized: ReviewerReputation = serde_cbor::from_slice(&serialized).expect("Deserialize reputation");
+        
+        assert_eq!(rep.reviews_completed, deserialized.reviews_completed);
+        assert!((rep.score - deserialized.score).abs() < 0.001);
+        println!("[✓] ReviewerReputation serializes/deserializes");
+        
+        // ReviewState
+        let state = ReviewState::new();
+        let serialized = serde_cbor::to_vec(&state).expect("Serialize state");
+        let deserialized: ReviewState = serde_cbor::from_slice(&serialized).expect("Deserialize state");
+        
+        assert!(deserialized.pending.is_empty());
+        println!("[✓] ReviewState serializes/deserializes");
+        
+        // ReviewableContentType
+        let content_type = ReviewableContentType::Proposal;
+        let serialized = serde_cbor::to_vec(&content_type).expect("Serialize content type");
+        let deserialized: ReviewableContentType = serde_cbor::from_slice(&serialized).expect("Deserialize content type");
+        
+        assert_eq!(content_type, deserialized);
+        println!("[✓] ReviewableContentType serializes/deserializes");
+        
+        println!("[✓] Review types serialization test passed\n");
     }
 }

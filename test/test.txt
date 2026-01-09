@@ -1,1 +1,2 @@
-This is a test of chunked encoding inside DIAGON.
+Test content file for HITL review system testing.
+Sample proposal text for review workflows and validation testing.
